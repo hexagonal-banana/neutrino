@@ -6,3 +6,5 @@ neutrino/build/preload.so
 neutrino/build/libcuda.so
 neutrino/build/libcuda.so.1
 .eggs/*
+neutrino/src/signature.c
+neutrino/src/unmodified.c

@@ -55,7 +55,10 @@ void* dlopen(const char *filename, int flags) {
         // fprintf(stderr, "[info] NEUTRINO_DRIVER_NAME: %s\n", NEUTRINO_DRIVER_NAME);
     }   
 
-    if (filename != NULL && (strstr(filename, NEUTRINO_DRIVER_NAME) != NULL)) {
+    const char *real_driver = getenv("NEUTRINO_REAL_DRIVER");
+    if (filename && real_driver && !strcmp(filename, real_driver))
+        return real_dlopen(filename, flags);
+    if (filename != NULL && NEUTRINO_DRIVER_NAME && (strstr(filename, NEUTRINO_DRIVER_NAME) != NULL)) {
         
         // Check if it's libcublas.so backtrace
         // @see https://man7.org/linux/man-pages/man3/backtrace.3.html
@@ -92,7 +95,7 @@ void* dlopen(const char *filename, int flags) {
             char* NEUTRINO_HOOK_DRIVER = getenv("NEUTRINO_HOOK_DRIVER");
             if (NEUTRINO_HOOK_DRIVER == NULL) {
                 fprintf(stderr, "[error] NEUTRINO_HOOK_DRIVER not set\n");
-                ptr = real_dlopen(filename, flags); // try to backup
+                return real_dlopen(filename, flags);
             }
             // @note fix the multiple initialization bug
             ptr = real_dlopen(NEUTRINO_HOOK_DRIVER, flags | RTLD_GLOBAL);

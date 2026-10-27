@@ -25,6 +25,7 @@ def main():
     NEUTRINO_MODE            : str = config["NEUTRINO_MODE"]
     # available built-in tools
     NEUTRINO_TOOLS = {tool[:-3] : tool for tool in os.listdir(NEUTRINO_TOOLS_DIR) if tool.endswith(".py")}
+    NEUTRINO_TOOLS['deepep_barrier'] = None
     
     parser = argparse.ArgumentParser(
         prog='neutrino', usage='%(prog)s [options] command',
@@ -50,6 +51,8 @@ def main():
                         help="enable benchmark mode to evaluate overhead w.r.t. the original kernel")
     parser.add_argument('--memusage', action='store_true', 
                         help="prevent the profiling and only measure the memory usage")
+    parser.add_argument('--barrier-kernel-only', choices=('baseline', 'probed'),
+                        help='Controlled single-stream kernel timing experiment; disables ordinary trace collection')
     # put command at the end of command
     parser.add_argument("command", nargs=argparse.REMAINDER) 
     # parse the arguments
@@ -69,14 +72,24 @@ def main():
     # Path to the real driver
     NEUTRINO_REAL_DRIVER: str = args.driver
     # command to be executed
-    command: str = args.command
-    assert len(command) > 0, "Command must be specified"
+    command = args.command
+    if command and command[0] == '--':
+        command = command[1:]
+    if not command:
+        parser.error('Command must be specified')
+    barrier_mode = args.probe == 'deepep_barrier'
+    if args.barrier_kernel_only and not barrier_mode:
+        parser.error('--barrier-kernel-only requires deepep_barrier')
+    if barrier_mode and (args.benchmark or args.memusage or args.filter or args.kernel or args.callback or NEUTRINO_MODE != 'CUDA'):
+        parser.error('deepep_barrier requires CUDA and forbids replay, filters, and callbacks')
     
     # Parse the PROBE
     NEUTRINO_PROBE_PATH: str = args.probe
     NEUTRINO_READING: str = None
     # NOTE endswith .py triggers the Tracing DSL
-    if NEUTRINO_PROBE_PATH.endswith(".py"):
+    if barrier_mode:
+        NEUTRINO_PROBE = {'mode': 'deepep_barrier', 'dynamic': False}
+    elif NEUTRINO_PROBE_PATH.endswith(".py"):
         from neutrino.language.compiler import compile
         source = open(NEUTRINO_PROBE_PATH, "r").read()
         NEUTRINO_PROBE = compile(NEUTRINO_MODE, source)
@@ -94,7 +107,7 @@ def main():
             
     # NOTE generate the trace reading code
     from neutrino.utils.trace_reading import gen_reading_code
-    NEUTRINO_READING = gen_reading_code(NEUTRINO_PROBE)
+    NEUTRINO_READING = None if barrier_mode else gen_reading_code(NEUTRINO_PROBE)
     
     # NOTE check if dynamic is True, shall have a specific keyword in top-level of probe
     NEUTRINO_DYNAMIC = "dynamic" in NEUTRINO_PROBE and NEUTRINO_PROBE["dynamic"] is True
@@ -114,6 +127,18 @@ def main():
 
     # a copied environment variables
     env = os.environ.copy()
+    env['NEUTRINO_BARRIER_MODE'] = str(int(barrier_mode))
+    env.pop('NEUTRINO_BARRIER_KERNEL_ONLY', None)
+    if args.barrier_kernel_only:
+        env['NEUTRINO_BARRIER_KERNEL_ONLY'] = args.barrier_kernel_only
+    if barrier_mode:
+        env['NEUTRINO_DYNAMIC'] = '0'
+        env['EP_JIT_WITH_LINEINFO'] = '1'
+        env['EP_JIT_DUMP_PTX'] = '1'
+        if not env.get('EP_JIT_CACHE_DIR'):
+            parser.error('Set a separate EP_JIT_CACHE_DIR before running deepep_barrier')
+    NEUTRINO_TRACEDIR = os.path.abspath(NEUTRINO_TRACEDIR)
+    os.makedirs(NEUTRINO_TRACEDIR, exist_ok=True)
     # configure Neutrino related environment variables
     env["NEUTRINO_REAL_DRIVER"]  = NEUTRINO_REAL_DRIVER
     env["NEUTRINO_DRIVER_NAME"]  = NEUTRINO_HOOK_DRIVER_NAME
@@ -159,7 +184,8 @@ def main():
     # start the program with new environment
     if len(command) > 0:
         proc = subprocess.Popen(command, env=env)
-        proc.wait()
+        status = proc.wait()
+        sys.exit(status if status >= 0 else 128 - status)
 
 if __name__ == "__main__":
     main()

@@ -9,8 +9,18 @@ import toml      # to load probes from envariables
 from neutrino.common import Register, Probe, Map, load
 from neutrino.probe import Ref, KernelParam
 
-workdir = sys.argv[1]     # directory contains original.bin
-log = open(os.path.join(workdir, "process.log"), 'w')
+workdir = sys.argv[1] if __name__ == '__main__' else None
+log = open(os.path.join(workdir, "process.log"), 'w') if workdir else sys.stderr
+
+if __name__ == '__main__' and os.environ.get('NEUTRINO_BARRIER_MODE') == '1':
+    from neutrino.probe.deepep_barrier import prepare
+    try:
+        prepare(sys.argv[2], workdir)
+    except Exception:
+        traceback.print_exc(file=log)
+        traceback.print_exc()
+        sys.exit(1)
+    sys.exit(0)
 
 # a macro like terms
 SUPPORTED_DATAMODEL = { "thread": 0, "warp": 1 }
