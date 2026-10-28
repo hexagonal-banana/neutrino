@@ -5,6 +5,7 @@ import os
 import sys
 import toml
 import argparse
+import uuid
 
 
 # Main Function, need a func to be referred by setup.py build system
@@ -53,6 +54,8 @@ def main():
                         help="prevent the profiling and only measure the memory usage")
     parser.add_argument('--barrier-kernel-only', choices=('baseline', 'probed'),
                         help='Controlled single-stream kernel timing experiment; disables ordinary trace collection')
+    parser.add_argument('--barrier-clock-align', choices=('host', 'none'),
+                        help='Host clock calibration; defaults to host for ordinary barrier traces and none for kernel-only timing')
     # put command at the end of command
     parser.add_argument("command", nargs=argparse.REMAINDER) 
     # parse the arguments
@@ -80,6 +83,11 @@ def main():
     barrier_mode = args.probe == 'deepep_barrier'
     if args.barrier_kernel_only and not barrier_mode:
         parser.error('--barrier-kernel-only requires deepep_barrier')
+    if args.barrier_clock_align and not barrier_mode:
+        parser.error('--barrier-clock-align requires deepep_barrier')
+    if args.barrier_clock_align == 'host' and args.barrier_kernel_only:
+        parser.error('Host clock alignment is disabled for kernel-only timing')
+    clock_alignment = args.barrier_clock_align or ('host' if barrier_mode and not args.barrier_kernel_only else 'none')
     if barrier_mode and (args.benchmark or args.memusage or args.filter or args.kernel or args.callback or NEUTRINO_MODE != 'CUDA'):
         parser.error('deepep_barrier requires CUDA and forbids replay, filters, and callbacks')
     
@@ -128,6 +136,8 @@ def main():
     # a copied environment variables
     env = os.environ.copy()
     env['NEUTRINO_BARRIER_MODE'] = str(int(barrier_mode))
+    env['NEUTRINO_BARRIER_CLOCK_ALIGN'] = clock_alignment
+    env['NEUTRINO_TRACE_SESSION'] = str(uuid.uuid4())
     env.pop('NEUTRINO_BARRIER_KERNEL_ONLY', None)
     if args.barrier_kernel_only:
         env['NEUTRINO_BARRIER_KERNEL_ONLY'] = args.barrier_kernel_only

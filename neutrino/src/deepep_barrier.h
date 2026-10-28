@@ -33,6 +33,9 @@ static NB_API(cuFuncSetAttribute);
 static NB_API(cuOccupancyMaxActiveBlocksPerMultiprocessor);
 static NB_API(cuStreamIsCapturing);
 static NB_API(cuModuleUnload);
+static NB_API(cuStreamCreate);
+static NB_API(cuStreamSynchronize);
+static NB_API(cuStreamDestroy_v2);
 #undef NB_API
 
 static void nb_init(void) {
@@ -46,6 +49,7 @@ static void nb_init(void) {
     NB_LOAD(cuMemcpyDtoHAsync_v2); NB_LOAD(cuFuncGetAttribute); NB_LOAD(cuFuncSetAttribute);
     NB_LOAD(cuOccupancyMaxActiveBlocksPerMultiprocessor); NB_LOAD(cuStreamIsCapturing);
     NB_LOAD(cuModuleUnload);
+    NB_LOAD(cuStreamCreate); NB_LOAD(cuStreamSynchronize); NB_LOAD(cuStreamDestroy_v2);
 #undef NB_LOAD
 }
 
@@ -81,6 +85,27 @@ typedef struct nb_buffer {
     uint64_t launch, executions;
     struct nb_buffer *next;
 } nb_buffer;
+#define NB_CLOCK_SAMPLES 32
+#define NB_CLOCK_WARMUPS 4
+typedef struct nb_clock_sample {
+    uint64_t before, gpu, after;
+} nb_clock_sample;
+typedef struct nb_clock {
+    CUcontext context;
+    CUmodule module;
+    CUfunction function;
+    CUstream stream;
+    CUdeviceptr device;
+    uint64_t *host;
+    uint64_t id, start_wall, end_wall;
+    CUuuid uuid;
+    int rank, ordinal;
+    nb_clock_sample start[NB_CLOCK_SAMPLES], end[NB_CLOCK_SAMPLES];
+    struct nb_clock *next;
+} nb_clock;
+static nb_clock *nb_clocks;
+static uint64_t nb_clock_id;
+static void nb_json_string(FILE *out, const char *s);
 static nb_library *nb_libraries;
 static nb_kernel *nb_kernels;
 static nb_function *nb_functions;
@@ -110,6 +135,104 @@ static int nb_kernel_only(void) {
         if (mode < 0) nb_fail("invalid kernel-only experiment mode");
     }
     return mode;
+}
+static int nb_clock_mode(void) {
+    const char *mode = getenv("NEUTRINO_BARRIER_CLOCK_ALIGN");
+    if (!mode || !strcmp(mode, "none")) return 0;
+    if (strcmp(mode, "host") || nb_kernel_only()) nb_fail("invalid clock alignment mode");
+    return 1;
+}
+static uint64_t nb_host_time(void) {
+    struct timespec t;
+    if (clock_gettime(CLOCK_MONOTONIC_RAW, &t)) nb_fail("host clock read failed");
+    return (uint64_t)t.tv_sec * 1000000000ull + t.tv_nsec;
+}
+static nb_clock *nb_find_clock(CUcontext context) {
+    for (nb_clock *c = nb_clocks; c; c = c->next) if (c->context == context) return c;
+    return NULL;
+}
+static void nb_clock_sample_batch(nb_clock *c, nb_clock_sample *samples, int warmups) {
+    void *args[] = {&c->device};
+    for (int i = -warmups; i < NB_CLOCK_SAMPLES; i++) {
+        uint64_t before = nb_host_time();
+        nb_check(real_cuLaunchKernel(c->function, 1, 1, 1, 1, 1, 1, 0, c->stream, args, NULL), "clock sample launch");
+        nb_check(nb_cuMemcpyDtoHAsync_v2(c->host, c->device, sizeof(uint64_t), c->stream), "clock sample readback");
+        nb_check(nb_cuStreamSynchronize(c->stream), "clock sample completion");
+        uint64_t after = nb_host_time();
+        if (i >= 0) samples[i] = (nb_clock_sample){before, *c->host, after};
+    }
+}
+static void nb_clock_write(nb_clock *c, int complete) {
+    char path[4096], hostname[256] = {0}, boot[80] = {0};
+    const char *session = getenv("NEUTRINO_TRACE_SESSION");
+    if (!session || !*session) nb_fail("missing clock collection session");
+    if (gethostname(hostname, sizeof(hostname) - 1)) nb_fail("host identity unavailable");
+    FILE *in = fopen("/proc/sys/kernel/random/boot_id", "r");
+    if (!in || fscanf(in, "%79s", boot) != 1) nb_fail("host boot identity unavailable");
+    fclose(in);
+    struct timespec resolution;
+    if (clock_getres(CLOCK_MONOTONIC_RAW, &resolution)) nb_fail("host clock resolution unavailable");
+    snprintf(path, sizeof(path), "%s/clock-%" PRIu64 ".json", RESULT_DIR, c->id);
+    FILE *out = fopen(path, "w");
+    if (!out) nb_fail("clock metadata write");
+    fprintf(out, "{\"schema\":1,\"calibration_id\":%" PRIu64 ",\"context_generation\":%" PRIu64 ",\"pid\":%d,\"rank\":%d,\"device\":%d,\"device_uuid\":\"", c->id, c->id, getpid(), c->rank, c->ordinal);
+    for (int i = 0; i < 16; i++) fprintf(out, "%02x", (unsigned char)c->uuid.bytes[i]);
+    fprintf(out, "\",\"session_id\":"); nb_json_string(out, session);
+    fprintf(out, ",\"hostname\":"); nb_json_string(out, hostname);
+    fprintf(out, ",\"boot_id\":"); nb_json_string(out, boot);
+    fprintf(out, ",\"clock\":\"CLOCK_MONOTONIC_RAW\",\"clock_resolution_ns\":%" PRIu64 ",\"complete\":%s,\"start_wall_ns\":%" PRIu64 ",\"end_wall_ns\":%" PRIu64,
+        (uint64_t)resolution.tv_sec * 1000000000ull + (uint64_t)resolution.tv_nsec,
+        complete ? "true" : "false", c->start_wall, c->end_wall);
+    for (int phase = 0; phase < 2; phase++) {
+        fprintf(out, ",\"%s\":[", phase ? "end" : "start");
+        nb_clock_sample *samples = phase ? c->end : c->start;
+        for (int i = 0; i < (phase && !complete ? 0 : NB_CLOCK_SAMPLES); i++) {
+            if (i) fputc(',', out);
+            fprintf(out, "{\"host_before_ns\":%" PRIu64 ",\"gpu_ns\":%" PRIu64 ",\"host_after_ns\":%" PRIu64 "}", samples[i].before, samples[i].gpu, samples[i].after);
+        }
+        fputc(']', out);
+    }
+    fprintf(out, "}\n");
+    if (fclose(out)) nb_fail("clock metadata close");
+}
+static void nb_clock_start(CUcontext context) {
+    if (!nb_clock_mode() || nb_find_clock(context)) return;
+    uint64_t started = nb_host_time();
+    nb_clock *c = nb_calloc(sizeof(*c));
+    c->context = context; c->id = ++nb_clock_id;
+    nb_check(nb_cuCtxGetDevice(&c->ordinal), "clock device");
+    nb_check(nb_cuDeviceGetUuid(&c->uuid, c->ordinal), "clock device UUID");
+    const char *rank = getenv("NEUTRINO_RANK");
+    c->rank = rank ? atoi(rank) : c->ordinal;
+    const char *ptx = ".version 6.0\n.target sm_50\n.address_size 64\n"
+        ".visible .entry __nb_clock(.param .u64 output) {\n"
+        ".reg .b64 p, t;\nld.param.u64 p, [output];\n"
+        "mov.u64 t, %globaltimer;\nst.global.u64 [p], t;\nret;\n}\n";
+    nb_check(real_cuModuleLoadData(&c->module, ptx), "load clock module");
+    nb_check(real_cuModuleGetFunction(&c->function, c->module, "__nb_clock"), "clock function");
+    nb_check(nb_cuStreamCreate(&c->stream, CU_STREAM_NON_BLOCKING), "clock stream");
+    nb_check(real_cuMemAlloc_v2(&c->device, sizeof(uint64_t)), "clock device buffer");
+    nb_check(nb_cuMemHostAlloc((void **)&c->host, sizeof(uint64_t), 0), "clock host buffer");
+    nb_clock_sample_batch(c, c->start, NB_CLOCK_WARMUPS);
+    c->start_wall = nb_host_time() - started;
+    c->next = nb_clocks; nb_clocks = c;
+    nb_clock_write(c, 0);
+}
+static void nb_clock_finish(CUcontext context) {
+    nb_clock **cp = &nb_clocks;
+    while (*cp && (*cp)->context != context) cp = &(*cp)->next;
+    nb_clock *c = *cp;
+    if (!c) return;
+    nb_check(real_cuCtxSynchronize(), "finish trace before clock calibration");
+    uint64_t started = nb_host_time();
+    nb_clock_sample_batch(c, c->end, 0);
+    c->end_wall = nb_host_time() - started;
+    nb_clock_write(c, 1);
+    nb_check(nb_cuStreamDestroy_v2(c->stream), "release clock stream");
+    nb_check(real_cuMemFree_v2(c->device), "release clock device buffer");
+    nb_check(nb_cuMemFreeHost(c->host), "release clock host buffer");
+    nb_check(nb_cuModuleUnload(c->module), "release clock module");
+    *cp = c->next; free(c);
 }
 static int nb_selected(const char *name) {
     return strstr(name, "_ZN7deep_ep2ep13dispatch_implILb") ||
@@ -191,6 +314,7 @@ static void nb_cleanup_context(CUcontext context) {
     pthread_mutex_lock(&nb_mutex);
     nb_check(nb_cuCtxPushCurrent_v2(context), "push cleanup context");
     nb_drain_locked(context, 1);
+    nb_clock_finish(context);
     nb_buffer **bp = &nb_buffers;
     while (*bp) {
         nb_buffer *b = *bp;
@@ -231,6 +355,12 @@ static void nb_cleanup_device(CUdevice device) {
         nb_check(nb_cuCtxPopCurrent_v2(&old), "pop buffer cleanup context");
         if (d == device) { nb_cleanup_context(context); b = nb_buffers; }
         else b = b->next;
+    }
+    nb_clock *c = nb_clocks;
+    while (c) {
+        CUcontext context = c->context;
+        if (c->ordinal == device) { nb_cleanup_context(context); c = nb_clocks; }
+        else c = c->next;
     }
 }
 
@@ -294,7 +424,13 @@ static void nb_metadata(nb_function *f, nb_buffer *b, const CUlaunchConfig *c, i
         for (size_t j = 0; j < sizeof(c->attrs[i].value); j++) fprintf(out, "%02x", ((unsigned char *)&c->attrs[i].value)[j]);
         fprintf(out, "\"}");
     }
-    fprintf(out, "],\"kernel_only_mode\":%d}\n", b->kernel_only); if (fclose(out)) nb_fail("launch metadata close");
+    fprintf(out, "],\"kernel_only_mode\":%d", b->kernel_only);
+    nb_clock *clock = nb_find_clock(f->context);
+    if (clock) {
+        fprintf(out, ",\"clock_alignment\":\"host\",\"calibration_id\":%" PRIu64 ",\"context_generation\":%" PRIu64 ",\"session_id\":", clock->id, clock->id);
+        nb_json_string(out, getenv("NEUTRINO_TRACE_SESSION"));
+    } else fprintf(out, ",\"clock_alignment\":\"none\"");
+    fprintf(out, "}\n"); if (fclose(out)) nb_fail("launch metadata close");
 }
 
 CUresult cuLibraryLoadFromFile(CUlibrary *library, const char *path, CUjit_option *opts, void **values, unsigned nopts, CUlibraryOption *lopts, void **lvalues, unsigned nlopts) {
@@ -381,6 +517,7 @@ CUresult cuLaunchKernelEx(const CUlaunchConfig *config, CUfunction function, voi
     for (unsigned i = 0; i < config->numAttrs; i++)
         if (config->attrs[i].id == CU_LAUNCH_ATTRIBUTE_COOPERATIVE) cooperative = config->attrs[i].value.cooperative;
     if (!cooperative || blocks > (uint64_t)active * sms) nb_fail("cooperative residency requirement not met");
+    nb_clock_start(context);
     size_t bytes = blocks * threads * f->slots * f->record_bytes;
     if (experiment) {
         nb_buffer *b = f->scratch;
@@ -453,4 +590,5 @@ __attribute__((destructor)) static void nb_shutdown(void) {
     if (!shared_lib || !nb_mode() || nb_failed) return;
     while (nb_buffers) nb_cleanup_context(nb_buffers->context);
     while (nb_functions) nb_cleanup_context(nb_functions->context);
+    while (nb_clocks) nb_cleanup_context(nb_clocks->context);
 }

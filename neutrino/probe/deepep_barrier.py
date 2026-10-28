@@ -267,10 +267,11 @@ def resolve(text):
                 todo.append((dest, next_state))
             else:
                 raise BoundaryError('Unterminated control flow')
-    return dict(schema=1, kernel=name, family=family, target=target[1],
+    return dict(schema=2, kernel=name, family=family, target=target[1],
                 params=len(re.findall(r'\.param\b', entry[2])), sites=result,
                 record_bytes=RECORD_BYTES, slots=2 * len(result), map_level='thread',
-                measurement='representative thread barrier residence time', clocks='unsynchronized per GPU')
+                thread_selection='all', thread_index='x + ntid.x * (y + ntid.y * z)',
+                measurement='per-thread barrier residence time', clocks='unsynchronized per GPU')
 
 
 def instrument(text, manifest):
@@ -285,20 +286,16 @@ def instrument(text, manifest):
 
     def record(site, kind, predicate=None):
         slot = site * 2 + kind
-        guard = f'and.pred %__nb_take, %__nb_rep, {predicate[1:]};' if predicate and not predicate.startswith('@!') else ''
-        if predicate and predicate.startswith('@!'):
-            guard = f'not.pred %__nb_take, {predicate[2:]};\nand.pred %__nb_take, %__nb_rep, %__nb_take;'
-        pred = '%__nb_take' if predicate else '%__nb_rep'
+        pred = predicate + ' ' if predicate else ''
         offset = slot * RECORD_BYTES
         return f'''// Neutrino barrier {site} {'exit' if kind else 'entry'}
-{guard}
-@{pred} mov.u64 %__nb_time, %globaltimer;
-@{pred} ld.global.u32 %__nb_count, [%__nb_ptr+{offset + 16}];
-@{pred} add.u32 %__nb_count, %__nb_count, 1;
-@{pred} st.global.u64 [%__nb_ptr+{offset}], %__nb_time;
-@{pred} st.global.u32 [%__nb_ptr+{offset + 8}], {site};
-@{pred} st.global.u32 [%__nb_ptr+{offset + 12}], {kind};
-@{pred} st.global.u32 [%__nb_ptr+{offset + 16}], %__nb_count;'''
+{pred}mov.u64 %__nb_time, %globaltimer;
+{pred}ld.global.u32 %__nb_count, [%__nb_ptr+{offset + 16}];
+{pred}add.u32 %__nb_count, %__nb_count, 1;
+{pred}st.global.u64 [%__nb_ptr+{offset}], %__nb_time;
+{pred}st.global.u32 [%__nb_ptr+{offset + 8}], {site};
+{pred}st.global.u32 [%__nb_ptr+{offset + 12}], {kind};
+{pred}st.global.u32 [%__nb_ptr+{offset + 16}], %__nb_count;'''
 
     for site in manifest['sites']:
         put(site['entry_line'] - 1, record(site['id'], 0))
@@ -306,15 +303,15 @@ def instrument(text, manifest):
             before = edge['kind'] in ('taken', 'return')
             put(edge['line'] - 1 if before else edge['end_line'], record(site['id'], 1, edge['predicate']))
     prolog = f'''
-.reg .pred %__nb_rep, %__nb_take;
-.reg .b32 %__nb_x, %__nb_y, %__nb_z, %__nb_b, %__nb_n, %__nb_count;
+.reg .b32 %__nb_x, %__nb_y, %__nb_z, %__nb_b, %__nb_n, %__nb_t, %__nb_count;
 .reg .b64 %__nb_ptr, %__nb_off, %__nb_time;
-mov.u32 %__nb_x, %tid.x;
+mov.u32 %__nb_t, %tid.z;
+mov.u32 %__nb_n, %ntid.y;
 mov.u32 %__nb_y, %tid.y;
-mov.u32 %__nb_z, %tid.z;
-or.b32 %__nb_x, %__nb_x, %__nb_y;
-or.b32 %__nb_x, %__nb_x, %__nb_z;
-setp.eq.u32 %__nb_rep, %__nb_x, 0;
+mad.lo.u32 %__nb_t, %__nb_t, %__nb_n, %__nb_y;
+mov.u32 %__nb_n, %ntid.x;
+mov.u32 %__nb_x, %tid.x;
+mad.lo.u32 %__nb_t, %__nb_t, %__nb_n, %__nb_x;
 mov.u32 %__nb_b, %ctaid.z;
 mov.u32 %__nb_n, %nctaid.y;
 mov.u32 %__nb_y, %ctaid.y;
@@ -327,7 +324,7 @@ mov.u32 %__nb_y, %ntid.y;
 mov.u32 %__nb_z, %ntid.z;
 mul.lo.u32 %__nb_n, %__nb_x, %__nb_y;
 mul.lo.u32 %__nb_n, %__nb_n, %__nb_z;
-mul.lo.u32 %__nb_b, %__nb_b, %__nb_n;
+mad.lo.u32 %__nb_b, %__nb_b, %__nb_n, %__nb_t;
 mul.wide.u32 %__nb_off, %__nb_b, {capacity * RECORD_BYTES};
 ld.param.u64 %__nb_ptr, [__nb_buffer];
 add.u64 %__nb_ptr, %__nb_ptr, %__nb_off;
