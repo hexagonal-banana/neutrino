@@ -331,6 +331,14 @@ CUresult cuLibraryGetModule(CUmodule* pMod, CUlibrary library) {
 CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ, unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ, unsigned int sharedMemBytes, CUstream hStream, void** kernelParams, void** extra) {
     if (shared_lib == NULL) { init(); }
     if (nb_mode()) {
+        if (nb_sync_mode()) {
+            if (!nb_tracked(f))
+                return real_cuLaunchKernel(f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, kernelParams, extra);
+            CUlaunchConfig config = {.gridDimX=gridDimX, .gridDimY=gridDimY, .gridDimZ=gridDimZ,
+                .blockDimX=blockDimX, .blockDimY=blockDimY, .blockDimZ=blockDimZ,
+                .sharedMemBytes=sharedMemBytes, .hStream=hStream};
+            return cuLaunchKernelEx(&config, f, kernelParams, extra);
+        }
         const char *name = NULL;
         nb_check(nb_cuFuncGetName(&name, f), "legacy launch coverage");
         if (nb_selected(name)) nb_fail("selected kernel requires the cooperative cuLaunchKernelEx path");

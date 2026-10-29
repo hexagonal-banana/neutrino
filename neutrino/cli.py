@@ -27,6 +27,7 @@ def main():
     # available built-in tools
     NEUTRINO_TOOLS = {tool[:-3] : tool for tool in os.listdir(NEUTRINO_TOOLS_DIR) if tool.endswith(".py")}
     NEUTRINO_TOOLS['deepep_barrier'] = None
+    NEUTRINO_TOOLS['ptx_sync'] = None
     
     parser = argparse.ArgumentParser(
         prog='neutrino', usage='%(prog)s [options] command',
@@ -56,6 +57,18 @@ def main():
                         help='Controlled single-stream kernel timing experiment; disables ordinary trace collection')
     parser.add_argument('--barrier-clock-align', choices=('host', 'none'),
                         help='Host clock calibration; defaults to host for ordinary barrier traces and none for kernel-only timing')
+    parser.add_argument('--sync-threads', choices=('warp', 'all'), default='warp',
+                        help='ptx_sync records lane 0 per warp (default), or every thread')
+    parser.add_argument('--sync-local-barriers', choices=('exclude', 'include'), default='exclude',
+                        help='Exclude bar.sync, barrier.sync, and bar.warp.sync probes; preserve original instructions')
+    parser.add_argument('--sync-capacity', type=int, default=256,
+                        help='ptx_sync intervals per recording unit per launch; overflow invalidates the recording')
+    parser.add_argument('--sync-waits', choices=('loop', 'instruction'), default='loop',
+                        help='Group recognized polling loops, or bracket every instruction execution')
+    parser.add_argument('--sync-buffer-mb', type=int, default=1024,
+                        help='ptx_sync maximum retained trace storage per process, on both host and GPU')
+    parser.add_argument('--sync-register-level', type=int, default=10,
+                        help='PTXAS register usage level; no-probe SASS equivalence is required')
     # put command at the end of command
     parser.add_argument("command", nargs=argparse.REMAINDER) 
     # parse the arguments
@@ -80,11 +93,14 @@ def main():
         command = command[1:]
     if not command:
         parser.error('Command must be specified')
-    barrier_mode = args.probe == 'deepep_barrier'
+    sync_mode = args.probe == 'ptx_sync'
+    barrier_mode = args.probe in ('deepep_barrier', 'ptx_sync')
+    if not 1 <= args.sync_capacity <= 65536 or not 1 <= args.sync_buffer_mb <= 8192 or not 0 <= args.sync_register_level <= 10:
+        parser.error('Invalid synchronization capacity, buffer limit, or register level')
     if args.barrier_kernel_only and not barrier_mode:
-        parser.error('--barrier-kernel-only requires deepep_barrier')
+        parser.error('--barrier-kernel-only requires deepep_barrier or ptx_sync')
     if args.barrier_clock_align and not barrier_mode:
-        parser.error('--barrier-clock-align requires deepep_barrier')
+        parser.error('--barrier-clock-align requires deepep_barrier or ptx_sync')
     if args.barrier_clock_align == 'host' and args.barrier_kernel_only:
         parser.error('Host clock alignment is disabled for kernel-only timing')
     clock_alignment = args.barrier_clock_align or ('host' if barrier_mode and not args.barrier_kernel_only else 'none')
@@ -96,7 +112,7 @@ def main():
     NEUTRINO_READING: str = None
     # NOTE endswith .py triggers the Tracing DSL
     if barrier_mode:
-        NEUTRINO_PROBE = {'mode': 'deepep_barrier', 'dynamic': False}
+        NEUTRINO_PROBE = {'mode': args.probe, 'dynamic': False}
     elif NEUTRINO_PROBE_PATH.endswith(".py"):
         from neutrino.language.compiler import compile
         source = open(NEUTRINO_PROBE_PATH, "r").read()
@@ -136,6 +152,13 @@ def main():
     # a copied environment variables
     env = os.environ.copy()
     env['NEUTRINO_BARRIER_MODE'] = str(int(barrier_mode))
+    env['NEUTRINO_PTX_SYNC'] = str(int(sync_mode))
+    env['NEUTRINO_SYNC_THREADS'] = args.sync_threads
+    env['NEUTRINO_SYNC_LOCAL_BARRIERS'] = args.sync_local_barriers
+    env['NEUTRINO_SYNC_CAPACITY'] = str(args.sync_capacity)
+    env['NEUTRINO_SYNC_WAITS'] = args.sync_waits
+    env['NEUTRINO_SYNC_BUFFER_MB'] = str(args.sync_buffer_mb)
+    env['NEUTRINO_SYNC_REGISTER_LEVEL'] = str(args.sync_register_level)
     env['NEUTRINO_BARRIER_CLOCK_ALIGN'] = clock_alignment
     env['NEUTRINO_TRACE_SESSION'] = str(uuid.uuid4())
     env.pop('NEUTRINO_BARRIER_KERNEL_ONLY', None)
@@ -143,6 +166,7 @@ def main():
         env['NEUTRINO_BARRIER_KERNEL_ONLY'] = args.barrier_kernel_only
     if barrier_mode:
         env['NEUTRINO_DYNAMIC'] = '0'
+    if barrier_mode and not sync_mode:
         env['EP_JIT_WITH_LINEINFO'] = '1'
         env['EP_JIT_DUMP_PTX'] = '1'
         if not env.get('EP_JIT_CACHE_DIR'):

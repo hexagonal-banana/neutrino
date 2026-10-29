@@ -13,7 +13,10 @@ workdir = sys.argv[1] if __name__ == '__main__' else None
 log = open(os.path.join(workdir, "process.log"), 'w') if workdir else sys.stderr
 
 if __name__ == '__main__' and os.environ.get('NEUTRINO_BARRIER_MODE') == '1':
-    from neutrino.probe.deepep_barrier import prepare
+    if os.environ.get('NEUTRINO_PTX_SYNC') == '1':
+        from neutrino.probe.ptx_sync import prepare
+    else:
+        from neutrino.probe.deepep_barrier import prepare
     try:
         prepare(sys.argv[2], workdir)
     except Exception:

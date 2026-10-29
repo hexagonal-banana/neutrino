@@ -192,7 +192,7 @@ def gencode(signature: Signature, template: str) -> str:
         param_val_list = ", ".join(param_val_list),
         before_call = (f"if (nb_mode()) nb_cleanup_context({param_val_list[0]});" if signature.func_name in ('cuCtxDestroy', 'cuCtxDestroy_v2') else
                        f"if (nb_mode()) nb_cleanup_device({param_val_list[0]});" if signature.func_name in ('cuDevicePrimaryCtxRelease', 'cuDevicePrimaryCtxRelease_v2', 'cuDevicePrimaryCtxReset', 'cuDevicePrimaryCtxReset_v2') else
-                       f'if (nb_mode()) {{ const char *name = NULL; nb_check(nb_cuFuncGetName(&name, {param_val_list[1] if signature.func_name == "cuLaunchKernelEx_ptsz" else param_val_list[0]}), "PTDS coverage name"); if (nb_selected(name)) nb_fail("selected PTDS launch is outside this prototype"); }}' if signature.func_name in ('cuLaunchKernelEx_ptsz', 'cuLaunchKernel_ptsz') else ''),
+                       f'if (nb_mode()) {{ const char *name = NULL; nb_check(nb_cuFuncGetName(&name, {param_val_list[1] if signature.func_name == "cuLaunchKernelEx_ptsz" else param_val_list[0]}), "PTDS coverage name"); if (nb_sync_mode() ? nb_tracked({param_val_list[1] if signature.func_name == "cuLaunchKernelEx_ptsz" else param_val_list[0]}) : nb_selected(name)) nb_fail("selected PTDS launch is outside this prototype"); }}' if signature.func_name in ('cuLaunchKernelEx_ptsz', 'cuLaunchKernel_ptsz') else ''),
         after_call = 'if (err == CUDA_SUCCESS) nb_drain_current();' if signature.func_name in ('cuCtxSynchronize', 'cuStreamSynchronize', 'cuStreamSynchronize_ptsz', 'cuEventSynchronize') else ''
     )
 

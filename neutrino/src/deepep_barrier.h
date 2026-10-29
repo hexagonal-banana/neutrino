@@ -7,6 +7,7 @@ static pthread_mutex_t nb_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int nb_failed, nb_exit_registered;
 static void nb_shutdown(void);
 static int nb_mode(void) { const char *s = getenv("NEUTRINO_BARRIER_MODE"); return s && !strcmp(s, "1"); }
+static int nb_sync_mode(void) { const char *s = getenv("NEUTRINO_PTX_SYNC"); return s && !strcmp(s, "1"); }
 #define NB_API(name) __typeof__(&name) nb_##name
 static NB_API(cuLibraryLoadFromFile);
 static NB_API(cuLibraryEnumerateKernels);
@@ -70,7 +71,8 @@ typedef struct nb_function {
     CUcontext context;
     nb_kernel *kernel;
     char workdir[4096];
-    unsigned params, slots, record_bytes;
+    unsigned params, slots, record_bytes, record_group;
+    int prepared;
     struct nb_buffer *scratch;
     struct nb_function *next;
 } nb_function;
@@ -114,7 +116,13 @@ static uint64_t nb_launch_id, nb_artifact_id;
 static size_t nb_allocated;
 static unsigned nb_buffer_count;
 #define NB_MAX_BUFFERS 64
-#define NB_MAX_BYTES (64ul * 1024 * 1024)
+static size_t nb_max_bytes(void) {
+    if (!nb_sync_mode()) return 64ul * 1024 * 1024;
+    const char *s = getenv("NEUTRINO_SYNC_BUFFER_MB");
+    unsigned long mb = s ? strtoul(s, NULL, 10) : 1024;
+    if (!mb || mb > 8192) return 0;
+    return mb * 1024ul * 1024;
+}
 
 static void nb_fail(const char *what) {
     nb_failed = 1; /* Error paths can hold nb_mutex; never reenter cleanup. */
@@ -235,9 +243,20 @@ static void nb_clock_finish(CUcontext context) {
     *cp = c->next; free(c);
 }
 static int nb_selected(const char *name) {
+    if (nb_sync_mode()) return 1;
     return strstr(name, "_ZN7deep_ep2ep13dispatch_implILb") ||
            strstr(name, "_ZN7deep_ep2ep12combine_implILb") ||
            strstr(name, "_ZN7deep_ep4comm12barrier_implILb");
+}
+static int nb_tracked(CUfunction function) {
+    CUcontext context = NULL;
+    nb_check(nb_cuCtxGetCurrent(&context), "tracked function context");
+    pthread_mutex_lock(&nb_mutex);
+    int found = 0;
+    for (nb_function *f = nb_functions; f; f = f->next)
+        if (f->original == function && f->context == context) { found = 1; break; }
+    pthread_mutex_unlock(&nb_mutex);
+    return found;
 }
 static nb_library *nb_find_library(CUlibrary h) {
     for (nb_library *l = nb_libraries; l; l = l->next) if (l->handle == h) return l;
@@ -365,7 +384,7 @@ static void nb_cleanup_device(CUdevice device) {
 }
 
 static void nb_prepare(nb_function *f) {
-    if (f->probed) return;
+    if (f->prepared) return;
     snprintf(f->workdir, sizeof(f->workdir), "%s/barrier-%" PRIu64, KERNEL_DIR, ++nb_artifact_id);
     if (mkdir(f->workdir, 0755)) nb_fail("artifact directory creation");
     /* posix_spawn avoids running Python or allocator code in a forked CUDA process. */
@@ -382,8 +401,18 @@ static void nb_prepare(nb_function *f) {
     snprintf(path, sizeof(path), "%s/barrier.info", f->workdir);
     FILE *in = fopen(path, "r");
     if (!in || fscanf(in, "%u %u %u\n%2047s", &f->params, &f->slots, &f->record_bytes, name) != 4) nb_fail("probe metadata invalid");
+    f->record_group = 1;
+    if (nb_sync_mode() && (fscanf(in, "%u", &f->record_group) != 1 ||
+            (f->record_group != 1 && f->record_group != 32))) nb_fail("invalid synchronization recording group");
     fclose(in);
-    if (strcmp(name, f->kernel->name) || f->params > 64 || f->slots > 4 || f->slots < 2 || f->record_bytes != 24) nb_fail("probe ABI mismatch");
+    if (strcmp(name, f->kernel->name) || f->params > 64 || f->record_bytes != 24 ||
+        (nb_sync_mode() ? f->slots > 65537 : (f->slots > 4 || f->slots < 2))) nb_fail("probe ABI mismatch");
+    f->prepared = 1;
+    if (!f->slots) {
+        fprintf(event_log, "[ptx-sync-no-sites] %s\n", name);
+        fflush(event_log);
+        return;
+    }
     snprintf(path, sizeof(path), "%s/probed.cubin", f->workdir);
     nb_check(real_cuModuleLoad(&f->module, path), "load probed module");
     nb_check(real_cuModuleGetFunction(&f->probed, f->module, name), "load probed function");
@@ -392,7 +421,8 @@ static nb_buffer *nb_acquire(CUcontext context, size_t bytes) {
     nb_drain_locked(context, 0);
     for (nb_buffer *b = nb_buffers; b; b = b->next)
         if (b->context == context && !b->kernel_only && !b->pending && b->capacity >= bytes) return b;
-    if (nb_buffer_count >= NB_MAX_BUFFERS || bytes > NB_MAX_BYTES - nb_allocated) nb_fail("pending trace storage limit exceeded");
+    size_t limit = nb_max_bytes();
+    if (nb_buffer_count >= NB_MAX_BUFFERS || nb_allocated > limit || bytes > limit - nb_allocated) nb_fail("pending trace storage limit exceeded");
     nb_buffer *b = nb_calloc(sizeof(*b));
     b->context = context; b->capacity = bytes;
     nb_check(real_cuMemAlloc_v2(&b->device, bytes), "allocate trace buffer");
@@ -484,11 +514,15 @@ CUresult cuLaunchKernelEx(const CUlaunchConfig *config, CUfunction function, voi
     if (!f) {
         const char *name = NULL;
         nb_check(nb_cuFuncGetName(&name, function), "coverage function name");
-        if (nb_selected(name)) nb_fail("selected function has no exact artifact association");
+        if (!nb_sync_mode() && nb_selected(name)) nb_fail("selected function has no exact artifact association");
+        if (nb_sync_mode()) {
+            static int warned;
+            if (!warned++) { fprintf(event_log, "[ptx-sync-coverage] In-memory and module-loaded kernels are outside file-library coverage\n"); fflush(event_log); }
+        }
         pthread_mutex_unlock(&nb_mutex);
         return real_cuLaunchKernelEx(config, function, params, extra);
     }
-    if (extra || !params || NEUTRINO_BENCHMARK || DYNAMIC) nb_fail("unsupported launch ABI/replay mode");
+    if (extra || (!params && !nb_sync_mode()) || NEUTRINO_BENCHMARK || DYNAMIC) nb_fail("unsupported launch ABI/replay mode");
     CUstreamCaptureStatus capture;
     nb_check(nb_cuStreamIsCapturing(config->hStream, &capture), "capture query");
     if (capture != CU_STREAM_CAPTURE_STATUS_NONE) nb_fail("CUDA Graph capture is out of scope");
@@ -499,6 +533,11 @@ CUresult cuLaunchKernelEx(const CUlaunchConfig *config, CUfunction function, voi
         nb_exit_registered = 1;
     }
     nb_prepare(f);
+    if (f->params && !params) nb_fail("missing original kernel arguments");
+    if (!f->slots) {
+        pthread_mutex_unlock(&nb_mutex);
+        return real_cuLaunchKernelEx(config, function, params, extra);
+    }
     int dynamic_smem, carveout, registers, active, sms; CUdevice device;
     nb_check(nb_cuFuncGetAttribute(&dynamic_smem, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, function), "shared memory attribute");
     nb_check(nb_cuFuncSetAttribute(f->probed, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, dynamic_smem), "copy shared memory attribute");
@@ -516,9 +555,10 @@ CUresult cuLaunchKernelEx(const CUlaunchConfig *config, CUfunction function, voi
     int cooperative = 0;
     for (unsigned i = 0; i < config->numAttrs; i++)
         if (config->attrs[i].id == CU_LAUNCH_ATTRIBUTE_COOPERATIVE) cooperative = config->attrs[i].value.cooperative;
-    if (!cooperative || blocks > (uint64_t)active * sms) nb_fail("cooperative residency requirement not met");
+    if ((!cooperative && !nb_sync_mode()) || (cooperative && blocks > (uint64_t)active * sms)) nb_fail("cooperative residency requirement not met");
     nb_clock_start(context);
-    size_t bytes = blocks * threads * f->slots * f->record_bytes;
+    uint64_t recording_units = (threads + f->record_group - 1) / f->record_group;
+    size_t bytes = blocks * recording_units * f->slots * f->record_bytes;
     if (experiment) {
         nb_buffer *b = f->scratch;
         if (!b) {
@@ -530,7 +570,7 @@ CUresult cuLaunchKernelEx(const CUlaunchConfig *config, CUfunction function, voi
         }
         if (b->stream != config->hStream || b->bytes != bytes || b->executions == UINT32_MAX)
             nb_fail("kernel-only experiment requires fixed dimensions and one ordered stream per function");
-        void *args[65]; memcpy(args, params, f->params * sizeof(void *)); args[f->params] = &b->device;
+        void *args[65]; if (f->params) memcpy(args, params, f->params * sizeof(void *)); args[f->params] = &b->device;
         CUresult r = real_cuLaunchKernelEx(config, launched, experiment == 1 ? params : args, NULL);
         nb_check(r, "kernel-only experiment launch failed");
         b->executions++; b->pending = 1;
@@ -538,7 +578,7 @@ CUresult cuLaunchKernelEx(const CUlaunchConfig *config, CUfunction function, voi
         return r;
     }
     nb_buffer *b = nb_acquire(context, bytes); b->bytes = bytes; b->launch = ++nb_launch_id;
-    void *args[65]; memcpy(args, params, f->params * sizeof(void *)); args[f->params] = &b->device;
+    void *args[65]; if (f->params) memcpy(args, params, f->params * sizeof(void *)); args[f->params] = &b->device;
     nb_check(nb_cuMemsetD8Async(b->device, 0, bytes, config->hStream), "clear fixed slots");
     /* The exact config pointer preserves ALL launch attributes, including PDL. */
     CUresult r = real_cuLaunchKernelEx(config, f->probed, args, NULL);

@@ -12,7 +12,8 @@ EVENT = struct.Struct('<QIIII')  # timestamp, site, kind, write count, reserved
 FIELDS = ['rank', 'device', 'launch_id', 'kernel', 'block_id', 'thread_id', 'barrier_site',
           'enter_ns', 'exit_ns', 'elapsed_ns', 'sync_at_end', 'status', 'pid', 'device_uuid', 'phase',
           'stream', 'context_generation', 'calibration_id', 'session_id', 'enter_host_ns', 'exit_host_ns',
-          'host_elapsed_ns', 'alignment_uncertainty_ns']
+          'host_elapsed_ns', 'alignment_uncertainty_ns', 'event_index', 'opcode', 'site_type', 'ptx_line', 'scope',
+          'warp_id', 'lane_id', 'thread_selection']
 
 
 def selected_threads(manifest, threads):
@@ -106,6 +107,10 @@ def decode_launch(meta, manifest, raw):
 
 
 def iter_decode_launch(meta, manifest, raw):
+    if manifest.get('mode') == 'ptx_sync':
+        from neutrino.utils.ptx_sync_trace import iter_decode_launch as decode_sync
+        yield from decode_sync(meta, manifest, raw)
+        return
     for shape in (meta['grid'], meta['block']):
         if len(shape) != 3 or any(not isinstance(n, int) or n <= 0 for n in shape):
             raise ValueError('Invalid launch dimensions')
@@ -179,9 +184,12 @@ def export(root, output, matrix=False, clock_align='auto', per_gpu=False):
         raise ValueError('Unsupported clock alignment mode')
     output.mkdir(parents=True, exist_ok=True)
     launches, errors, models = [], [], {}
+    launch_records = []
     seen, lanes = set(), {}
+    warp_lanes = set()
     origins, counts = {}, defaultdict(Counter)
     pairs, invalid, aligned_launches = 0, 0, 0
+    sync_opcodes, sync_types, max_thread_intervals = Counter(), Counter(), 0
     domain, common_origin = None, None
     for path in sorted(root.glob('*/result/barrier-*.json')):
         try:
@@ -191,9 +199,9 @@ def export(root, output, matrix=False, clock_align='auto', per_gpu=False):
                 raise ValueError(f'Duplicate launch identity {key}')
             seen.add(key)
             attributes = {a['id']: bytes.fromhex(a['raw']) for a in meta['attributes']}
-            if int.from_bytes(attributes.get(2, b'')[:4], 'little') != 1:
-                raise ValueError('Missing cooperative launch attribute')
             manifest = json.loads(Path(meta['manifest']).read_text())
+            if manifest.get('mode') != 'ptx_sync' and int.from_bytes(attributes.get(2, b'')[:4], 'little') != 1:
+                raise ValueError('Missing cooperative launch attribute')
             if meta['kernel'] != manifest['kernel']:
                 raise ValueError('Kernel/manifest mismatch')
             model = None
@@ -214,8 +222,14 @@ def export(root, output, matrix=False, clock_align='auto', per_gpu=False):
             elif clock_align == 'host':
                 raise ValueError('Missing host clock calibration for selected launch')
             # Pass one retains only launch metadata and unique lane identities.
-            for row in iter_decode_launch(meta, manifest, path.with_suffix('.bin').read_bytes()):
+            raw = path.with_suffix('.bin').read_bytes()
+            intervals, first, last, opcodes = 0, None, None, Counter()
+            for row in iter_decode_launch(meta, manifest, raw):
                 pairs += 1
+                intervals += 1
+                first = row['enter_ns'] if first is None else min(first, row['enter_ns'])
+                last = row['exit_ns'] if last is None else max(last, row['exit_ns'])
+                opcodes[row.get('opcode', 'barrier')] += 1
                 if row['status'] != 'ok':
                     invalid += 1
                     continue
@@ -226,10 +240,21 @@ def export(root, output, matrix=False, clock_align='auto', per_gpu=False):
                 else:
                     gpu = row['device_uuid']
                     origins[gpu] = min(origins.get(gpu, row['enter_ns']), row['enter_ns'])
+                if manifest.get('mode') == 'ptx_sync':
+                    sync_opcodes[row['opcode']] += 1
+                    sync_types[row['site_type']] += 1
+                    max_thread_intervals = max(max_thread_intervals, row['event_index'] + 1)
                 lane = lane_key(row)
+                if row.get('thread_selection') == 'warp':
+                    warp_lanes.add(lane)
                 if lane not in lanes:
                     lanes[lane] = len(lanes)
             launches.append((path, meta, manifest, model))
+            launch_records.append(dict(rank=meta['rank'], pid=meta['pid'], device_uuid=meta['device_uuid'],
+                launch_id=meta['launch_id'], session_id=meta.get('session_id', 'legacy'),
+                context_generation=meta.get('context_generation', 0),
+                kernel=meta['kernel'], intervals=intervals, raw_bytes=len(raw),
+                first_enter_ns=first, last_exit_ns=last, opcode_intervals=dict(opcodes)))
             counts[meta['rank']][manifest['family']] += 1
             aligned_launches += model is not None
         except (OSError, ValueError, KeyError, TypeError) as error:
@@ -263,17 +288,26 @@ def export(root, output, matrix=False, clock_align='auto', per_gpu=False):
     reports = [model.report() for model in models.values()]
     process_ids = {key: i for i, key in enumerate(sorted({process_key(m) for _, m, _, _ in launches},
                    key=lambda k: (k[2], k[3], k[1], k[0])))}
-    summary = dict(launches=len(launches),
+    warp_recording = any(s.get('thread_selection') == 'warp' for _, _, s, _ in launches)
+    summary = dict(launches=len(launches), launch_records=launch_records,
         block_site_pairs=sum(prod(m['grid']) * len(s['sites']) for _, m, s, _ in launches),
-        thread_site_pairs=pairs, valid_pairs=pairs - invalid,
+        thread_site_pairs=pairs, recording_unit_intervals=pairs, valid_pairs=pairs - invalid,
         thread_selections=sorted({s.get('thread_selection', 'thread0') for _, _, s, _ in launches}),
         launches_per_rank={str(k): dict(v) for k, v in counts.items()},
         rank_gpu_groups=len(process_ids), tracks=len(lanes),
+        sync_opcode_intervals=dict(sync_opcodes), sync_interval_types=dict(sync_types),
+        max_intervals_per_recording_unit=max_thread_intervals,
+        max_intervals_per_thread=max_thread_intervals if not warp_recording else None,
         clocks='host-aligned (estimated uncertainty)' if aligned else 'unsynchronized; independent per-GPU display origins',
         common_origin_host_ns=common_origin if aligned else None,
         gpu_origins_ns={} if aligned else origins, calibrations=reports,
-        cross_gpu_uncertainty='Sum of the two per-event uncertainties; ordering inside this interval is unresolved',
-        measurement='per-thread barrier residence time, not pure communication latency',
+        cross_gpu_uncertainty=('Sum of the two per-event uncertainties; ordering inside this interval is unresolved'
+                               if aligned else 'Unavailable: independent GPU clocks must not be compared'),
+        measurement=('per-warp lane-0 PTX synchronization intervals, not whole-warp or pure communication latency'
+                     if warp_recording else 'per-thread PTX synchronization intervals, not pure communication latency'
+                     if any(s.get('mode') == 'ptx_sync' for _, _, s, _ in launches)
+                     else 'per-thread barrier residence time, not pure communication latency'),
+        probe_limitations=sorted({item for _, _, s, _ in launches for item in s.get('limitations', [])}),
         limitations=['instrumentation and readback overhead',
                      'affine-clock assumption; uncertainty is empirical, not a hardware guarantee' if aligned else 'no cross-GPU clock alignment'],
         status='failed' if errors else 'passed', errors=errors)
@@ -299,8 +333,9 @@ def export(root, output, matrix=False, clock_align='auto', per_gpu=False):
                 emit(dict(ph='M', name='process_sort_index', pid=pid, tid=0, args=dict(sort_index=pid)), gpu)
             for lane, tid in lanes.items():
                 process, context, stream, block, thread = lane
+                unit = f'warp {thread // 32} / lane 0' if lane in warp_lanes else f'thread {thread}'
                 emit(dict(ph='M', name='thread_name', pid=process_ids[process], tid=tid,
-                          args=dict(name=f'Context {context} / stream {stream} / block {block} / thread {thread}')), process[3])
+                          args=dict(name=f'Context {context} / stream {stream} / block {block} / {unit}')), process[3])
             for path, meta, manifest, model in launches:
                 for row in iter_decode_launch(meta, manifest, path.with_suffix('.bin').read_bytes()):
                     if model:
@@ -313,7 +348,10 @@ def export(root, output, matrix=False, clock_align='auto', per_gpu=False):
                     csv_writer.writerow(row)
                     # Strings retain uint64 precision in JavaScript event arguments.
                     event_args = {k: str(v) if k.endswith('_ns') and type(v) is int else v for k, v in row.items()}
-                    emit(dict(ph='X', cat='barrier residence time', name=f"{row['phase']} barrier",
+                    generic = manifest.get('mode') == 'ptx_sync'
+                    emit(dict(ph='X', cat=row['phase'] if generic else 'barrier residence time',
+                              name=(f"{row['opcode']} / {row['site_type']} / site {row['barrier_site']}"
+                                    if generic else f"{row['phase']} barrier"),
                               pid=process_ids[process_key(row)], tid=lanes[lane_key(row)],
                               ts=ts, dur=duration, args=event_args), row['device_uuid'])
         main.finish(summary)
