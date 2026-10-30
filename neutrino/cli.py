@@ -57,14 +57,16 @@ def main():
                         help='Controlled single-stream kernel timing experiment; disables ordinary trace collection')
     parser.add_argument('--barrier-clock-align', choices=('host', 'none'),
                         help='Host clock calibration; defaults to host for ordinary barrier traces and none for kernel-only timing')
-    parser.add_argument('--sync-threads', choices=('warp', 'all'), default='warp',
-                        help='ptx_sync records lane 0 per warp (default), or every thread')
+    parser.add_argument('--sync-threads', choices=('warp', 'all', 'block'),
+                        help='Record lane 0 per warp, every thread, or thread 0 per block (aware only); defaults: ptx_sync=warp, deepep_barrier=all')
     parser.add_argument('--sync-local-barriers', choices=('exclude', 'include'), default='exclude',
                         help='Exclude bar.sync, barrier.sync, and bar.warp.sync probes; preserve original instructions')
+    parser.add_argument('--sync-scope', choices=('all', 'sys'), default='all',
+                        help='ptx_sync scope filter; sys excludes GPU/grid/CTA and implicit-scope probes')
     parser.add_argument('--sync-capacity', type=int, default=256,
                         help='ptx_sync intervals per recording unit per launch; overflow invalidates the recording')
-    parser.add_argument('--sync-waits', choices=('loop', 'instruction'), default='loop',
-                        help='Group recognized polling loops, or bracket every instruction execution')
+    parser.add_argument('--sync-waits', choices=('loop', 'instruction', 'episode'), default='loop',
+                        help='Group pure polling loops, bracket instructions, or include cooperative sys polling episodes')
     parser.add_argument('--sync-buffer-mb', type=int, default=1024,
                         help='ptx_sync maximum retained trace storage per process, on both host and GPU')
     parser.add_argument('--sync-register-level', type=int, default=10,
@@ -94,6 +96,13 @@ def main():
     if not command:
         parser.error('Command must be specified')
     sync_mode = args.probe == 'ptx_sync'
+    if args.sync_scope != 'all' and not sync_mode:
+        parser.error('--sync-scope requires ptx_sync')
+    if args.sync_waits == 'episode' and (not sync_mode or args.sync_scope != 'sys' or args.sync_local_barriers != 'exclude'):
+        parser.error('--sync-waits episode requires ptx_sync, --sync-scope sys, and excluded local barriers')
+    args.sync_threads = args.sync_threads or ('warp' if sync_mode else 'all')
+    if args.sync_threads == 'block' and args.probe != 'deepep_barrier':
+        parser.error('--sync-threads block requires deepep_barrier')
     barrier_mode = args.probe in ('deepep_barrier', 'ptx_sync')
     if not 1 <= args.sync_capacity <= 65536 or not 1 <= args.sync_buffer_mb <= 8192 or not 0 <= args.sync_register_level <= 10:
         parser.error('Invalid synchronization capacity, buffer limit, or register level')
@@ -155,6 +164,7 @@ def main():
     env['NEUTRINO_PTX_SYNC'] = str(int(sync_mode))
     env['NEUTRINO_SYNC_THREADS'] = args.sync_threads
     env['NEUTRINO_SYNC_LOCAL_BARRIERS'] = args.sync_local_barriers
+    env['NEUTRINO_SYNC_SCOPE'] = args.sync_scope
     env['NEUTRINO_SYNC_CAPACITY'] = str(args.sync_capacity)
     env['NEUTRINO_SYNC_WAITS'] = args.sync_waits
     env['NEUTRINO_SYNC_BUFFER_MB'] = str(args.sync_buffer_mb)

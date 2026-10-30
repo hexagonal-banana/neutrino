@@ -18,8 +18,18 @@ FIELDS = ['rank', 'device', 'launch_id', 'kernel', 'block_id', 'thread_id', 'bar
 
 def selected_threads(manifest, threads):
     selection = manifest.get('thread_selection', 'thread0' if manifest.get('schema', 1) == 1 else None)
-    if selection not in ('all', 'thread0'):
+    if selection not in ('all', 'thread0', 'warp', 'block'):
         raise ValueError('Missing or unsupported thread selection')
+    if selection == 'warp':
+        if (manifest.get('schema') != 3 or manifest.get('record_group') != 32 or
+                manifest.get('representative_lane') != 0):
+            raise ValueError('Invalid compact warp record ABI')
+        return range(0, threads, 32)
+    if selection == 'block':
+        if (manifest.get('schema') != 4 or manifest.get('record_group') != 0 or
+                manifest.get('representative_thread') != 0):
+            raise ValueError('Invalid compact block record ABI')
+        return range(1)
     return range(threads) if selection == 'all' else range(1)
 
 
@@ -120,11 +130,14 @@ def iter_decode_launch(meta, manifest, raw):
     slots = manifest['slots']
     if slots != 2 * len(manifest['sites']) or manifest['record_bytes'] != EVENT.size:
         raise ValueError('Invalid map capacity or record ABI')
-    if len(raw) != blocks * threads * slots * EVENT.size:
-        raise ValueError('Truncated or oversized fixed thread map')
     selected = selected_threads(manifest, threads)
-    for index in range(blocks * threads):
-        block, thread = divmod(index, threads)
+    warp = manifest.get('thread_selection') == 'warp'
+    units = len(selected) if warp or manifest.get('thread_selection') == 'block' else threads
+    if len(raw) != blocks * units * slots * EVENT.size:
+        raise ValueError('Truncated or oversized fixed recording-unit map')
+    for index in range(blocks * units):
+        block, unit = divmod(index, units)
+        thread = unit * 32 if warp else unit
         base = index * slots * EVENT.size
         if thread not in selected:
             if any(raw[base:base + slots * EVENT.size]):
@@ -147,6 +160,8 @@ def iter_decode_launch(meta, manifest, raw):
             previous = exit_
             yield dict(rank=meta['rank'], device=meta['device'], launch_id=meta['launch_id'],
                        kernel=meta['kernel'], block_id=block, thread_id=thread, barrier_site=site['id'],
+                       warp_id=thread // 32, lane_id=thread % 32,
+                       thread_selection=manifest.get('thread_selection', 'thread0'),
                        enter_ns=enter, exit_ns=exit_, elapsed_ns=exit_ - enter if not problems else '',
                        sync_at_end=site['sync_at_end'], status='|'.join(sorted(set(problems))) or 'ok',
                        pid=meta['pid'], device_uuid=meta['device_uuid'], phase=site['phase'],
@@ -224,6 +239,7 @@ def export(root, output, matrix=False, clock_align='auto', per_gpu=False):
             # Pass one retains only launch metadata and unique lane identities.
             raw = path.with_suffix('.bin').read_bytes()
             intervals, first, last, opcodes = 0, None, None, Counter()
+            first_host, last_host, max_uncertainty = None, None, 0
             for row in iter_decode_launch(meta, manifest, raw):
                 pairs += 1
                 intervals += 1
@@ -235,7 +251,10 @@ def export(root, output, matrix=False, clock_align='auto', per_gpu=False):
                     continue
                 if model:
                     aligned = model.align(row)
-                    start = aligned['enter_host_ns']
+                    start, finish = aligned['enter_host_ns'], aligned['exit_host_ns']
+                    first_host = start if first_host is None else min(first_host, start)
+                    last_host = finish if last_host is None else max(last_host, finish)
+                    max_uncertainty = max(max_uncertainty, aligned['alignment_uncertainty_ns'])
                     common_origin = start if common_origin is None else min(common_origin, start)
                 else:
                     gpu = row['device_uuid']
@@ -254,7 +273,9 @@ def export(root, output, matrix=False, clock_align='auto', per_gpu=False):
                 launch_id=meta['launch_id'], session_id=meta.get('session_id', 'legacy'),
                 context_generation=meta.get('context_generation', 0),
                 kernel=meta['kernel'], intervals=intervals, raw_bytes=len(raw),
-                first_enter_ns=first, last_exit_ns=last, opcode_intervals=dict(opcodes)))
+                first_enter_ns=first, last_exit_ns=last, opcode_intervals=dict(opcodes),
+                first_enter_host_ns=first_host, last_exit_host_ns=last_host,
+                max_alignment_uncertainty_ns=max_uncertainty if model else None))
             counts[meta['rank']][manifest['family']] += 1
             aligned_launches += model is not None
         except (OSError, ValueError, KeyError, TypeError) as error:
@@ -293,6 +314,8 @@ def export(root, output, matrix=False, clock_align='auto', per_gpu=False):
         block_site_pairs=sum(prod(m['grid']) * len(s['sites']) for _, m, s, _ in launches),
         thread_site_pairs=pairs, recording_unit_intervals=pairs, valid_pairs=pairs - invalid,
         thread_selections=sorted({s.get('thread_selection', 'thread0') for _, _, s, _ in launches}),
+        sync_scopes=sorted({s.get('sync_scope', 'all') for _, _, s, _ in launches if s.get('mode') == 'ptx_sync'}),
+        sync_wait_modes=sorted({s.get('waits', 'loop') for _, _, s, _ in launches if s.get('mode') == 'ptx_sync'}),
         launches_per_rank={str(k): dict(v) for k, v in counts.items()},
         rank_gpu_groups=len(process_ids), tracks=len(lanes),
         sync_opcode_intervals=dict(sync_opcodes), sync_interval_types=dict(sync_types),
@@ -303,10 +326,15 @@ def export(root, output, matrix=False, clock_align='auto', per_gpu=False):
         gpu_origins_ns={} if aligned else origins, calibrations=reports,
         cross_gpu_uncertainty=('Sum of the two per-event uncertainties; ordering inside this interval is unresolved'
                                if aligned else 'Unavailable: independent GPU clocks must not be compared'),
-        measurement=('per-warp lane-0 PTX synchronization intervals, not whole-warp or pure communication latency'
+        measurement=('per-warp lane-0 outer-barrier timestamp intervals; effective wait completion unvalidated'
+                     if warp_recording and all(s.get('mode') != 'ptx_sync' for _, _, s, _ in launches) else
+                     'per-warp lane-0 PTX synchronization intervals, not whole-warp or pure communication latency'
                      if warp_recording else 'per-thread PTX synchronization intervals, not pure communication latency'
                      if any(s.get('mode') == 'ptx_sync' for _, _, s, _ in launches)
-                     else 'per-thread barrier residence time, not pure communication latency'),
+                     else 'per-block thread-0 outer-barrier timestamp intervals; effective wait completion unvalidated'
+                     if all(s.get('thread_selection') == 'block' for _, _, s, _ in launches)
+                     else 'per-thread outer-barrier timestamp intervals; effective wait completion unvalidated'),
+        timestamp_ordering='unvalidated' if any(s.get('mode') != 'ptx_sync' for _, _, s, _ in launches) else None,
         probe_limitations=sorted({item for _, _, s, _ in launches for item in s.get('limitations', [])}),
         limitations=['instrumentation and readback overhead',
                      'affine-clock assumption; uncertainty is empirical, not a hardware guarantee' if aligned else 'no cross-GPU clock alignment'],
@@ -333,7 +361,8 @@ def export(root, output, matrix=False, clock_align='auto', per_gpu=False):
                 emit(dict(ph='M', name='process_sort_index', pid=pid, tid=0, args=dict(sort_index=pid)), gpu)
             for lane, tid in lanes.items():
                 process, context, stream, block, thread = lane
-                unit = f'warp {thread // 32} / lane 0' if lane in warp_lanes else f'thread {thread}'
+                unit = (f'warp {thread // 32} / lane 0' if lane in warp_lanes else
+                        f'warp {thread // 32} / lane {thread % 32} / thread {thread}')
                 emit(dict(ph='M', name='thread_name', pid=process_ids[process], tid=tid,
                           args=dict(name=f'Context {context} / stream {stream} / block {block} / {unit}')), process[3])
             for path, meta, manifest, model in launches:
@@ -349,7 +378,19 @@ def export(root, output, matrix=False, clock_align='auto', per_gpu=False):
                     # Strings retain uint64 precision in JavaScript event arguments.
                     event_args = {k: str(v) if k.endswith('_ns') and type(v) is int else v for k, v in row.items()}
                     generic = manifest.get('mode') == 'ptx_sync'
-                    emit(dict(ph='X', cat=row['phase'] if generic else 'barrier residence time',
+                    if generic and row['site_type'] == 'polling_episode':
+                        site = manifest['sites'][row['barrier_site']]
+                        event_args.update(includes_warp_coordination=True,
+                                          measurement_bounds=site['bounds'], participants=site['participants'])
+                    if not generic:
+                        site = manifest['sites'][row['barrier_site']]
+                        event_args.update(timestamp_ordering='unvalidated',
+                                          transport=site.get('transport', 'unknown'))
+                        if manifest['family'] == 'hybrid_dispatch':
+                            event_args.update(scaleout_ranks=site['scaleout_ranks'],
+                                              scaleup_ranks=site['scaleup_ranks'],
+                                              barrier_scope='scaleup + scaleout' if row['phase'] == 'entry' else 'scaleup only')
+                    emit(dict(ph='X', cat=row['phase'] if generic else 'sampled outer-barrier interval',
                               name=(f"{row['opcode']} / {row['site_type']} / site {row['barrier_site']}"
                                     if generic else f"{row['phase']} barrier"),
                               pid=process_ids[process_key(row)], tid=lanes[lane_key(row)],

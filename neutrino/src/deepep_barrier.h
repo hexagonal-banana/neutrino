@@ -245,6 +245,7 @@ static void nb_clock_finish(CUcontext context) {
 static int nb_selected(const char *name) {
     if (nb_sync_mode()) return 1;
     return strstr(name, "_ZN7deep_ep2ep13dispatch_implILb") ||
+           strstr(name, "_ZN7deep_ep2ep20hybrid_dispatch_implILb") ||
            strstr(name, "_ZN7deep_ep2ep12combine_implILb") ||
            strstr(name, "_ZN7deep_ep4comm12barrier_implILb");
 }
@@ -402,8 +403,10 @@ static void nb_prepare(nb_function *f) {
     FILE *in = fopen(path, "r");
     if (!in || fscanf(in, "%u %u %u\n%2047s", &f->params, &f->slots, &f->record_bytes, name) != 4) nb_fail("probe metadata invalid");
     f->record_group = 1;
-    if (nb_sync_mode() && (fscanf(in, "%u", &f->record_group) != 1 ||
-            (f->record_group != 1 && f->record_group != 32))) nb_fail("invalid synchronization recording group");
+    int group_fields = fscanf(in, "%u", &f->record_group);
+    if ((group_fields != 1 && (nb_sync_mode() || group_fields != EOF)) ||
+            (f->record_group != 1 && f->record_group != 32 && (f->record_group != 0 || nb_sync_mode())))
+            nb_fail("invalid synchronization recording group");
     fclose(in);
     if (strcmp(name, f->kernel->name) || f->params > 64 || f->record_bytes != 24 ||
         (nb_sync_mode() ? f->slots > 65537 : (f->slots > 4 || f->slots < 2))) nb_fail("probe ABI mismatch");
@@ -557,7 +560,8 @@ CUresult cuLaunchKernelEx(const CUlaunchConfig *config, CUfunction function, voi
         if (config->attrs[i].id == CU_LAUNCH_ATTRIBUTE_COOPERATIVE) cooperative = config->attrs[i].value.cooperative;
     if ((!cooperative && !nb_sync_mode()) || (cooperative && blocks > (uint64_t)active * sms)) nb_fail("cooperative residency requirement not met");
     nb_clock_start(context);
-    uint64_t recording_units = (threads + f->record_group - 1) / f->record_group;
+    /* Group zero denotes one compact thread-0 record per block (aware probes only). */
+    uint64_t recording_units = f->record_group ? (threads + f->record_group - 1) / f->record_group : 1;
     size_t bytes = blocks * recording_units * f->slots * f->record_bytes;
     if (experiment) {
         nb_buffer *b = f->scratch;

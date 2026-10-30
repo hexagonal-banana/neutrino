@@ -18,7 +18,9 @@ if __name__ == '__main__' and os.environ.get('NEUTRINO_BARRIER_MODE') == '1':
     else:
         from neutrino.probe.deepep_barrier import prepare
     try:
-        prepare(sys.argv[2], workdir)
+        options = {} if os.environ.get('NEUTRINO_PTX_SYNC') == '1' else {
+            'threads': os.environ.get('NEUTRINO_SYNC_THREADS', 'all')}
+        prepare(sys.argv[2], workdir, **options)
     except Exception:
         traceback.print_exc(file=log)
         traceback.print_exc()

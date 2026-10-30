@@ -120,13 +120,22 @@ def parse(text):
 def resolve(text):
     lines, entry, opening, closing, files, candidates, ins, labels = parse(text)
     name = entry[1]
-    family = next((k for k in ('dispatch', 'combine', 'barrier')
+    family = next((k for k in ('hybrid_dispatch', 'dispatch', 'combine', 'barrier')
                    if re.search(rf'\d+{k}_implI', name)), None)
     transport = re.search(rf'\d+{family}_implILb([01])E', name) if family else None
     if transport is None:
-        raise BoundaryError(f'Unsupported non-direct kernel: {name}')
-    is_nvlink = int(transport[1])
+        raise BoundaryError(f'Unsupported kernel: {name}')
+    is_nvlink = 1 if family == 'hybrid_dispatch' else int(transport[1])
     expected = 1 if family == 'barrier' else 2
+    kernel_topology = None
+    if family == 'barrier':
+        parameters = re.search(r'12barrier_implI((?:L[bil]n?\d+E){8})E', name)
+        if not parameters:
+            raise BoundaryError('Unsupported standalone barrier template')
+        values = [int(v.replace('n', '-')) for v in re.findall(r'L[bil](n?\d+)E', parameters[1])]
+        kernel_topology = values[3:5]
+        if values[-1] and values[3] > 1:
+            expected = 2
     if len(candidates) != expected:
         raise BoundaryError(f'Expected {expected} outer barrier sites, found {len(candidates)}')
     if len({key[1] for key in candidates}) != expected:
@@ -211,23 +220,28 @@ def resolve(text):
         if not exits:
             raise BoundaryError('No normal exit edges')
         nvlink, scaleout, ranks, blocks, threads, qps, timeout, tag, flush, sync_start, sync_end = values
-        if nvlink != is_nvlink or scaleout != 1 or ranks < 2 or (flush and not sync_start):
+        hybrid = family == 'hybrid_dispatch' or (family == 'barrier' and kernel_topology[0] > 1)
+        if (nvlink != is_nvlink or scaleout < 1 or ranks < 2 or (flush and not sync_start) or
+                (hybrid and (not nvlink or scaleout <= 1)) or (not hybrid and scaleout != 1) or
+                (kernel_topology is not None and [scaleout, ranks] != kernel_topology)):
             raise BoundaryError('Unsupported barrier synchronization parameters')
         source = files.get(key[1][0], '')
         if not source.endswith(f'/deep_ep/impls/{"comm" if family == "barrier" else "ep"}/{family}.cuh'):
             raise BoundaryError(f'Unexpected source call site: {source}')
         source_line = key[1][1]
-        phase = 'standalone' if family == 'barrier' else ('entry' if tag in (2, 4) else 'completion')
+        phase = 'standalone' if family == 'barrier' else ('entry' if tag in (2, 4, 6) else 'completion')
         result.append(dict(source=source, source_line=source_line, tag=tag, phase=phase,
                            flush_stores=bool(flush), sync_at_start=bool(sync_start), sync_at_end=bool(sync_end),
-                           blocks=blocks, threads=threads, ranks=ranks, qps=qps,
-                           transport='nvlink' if nvlink else 'direct_rdma', entry_line=ins[lo].line + 1,
+                           blocks=blocks, threads=threads, ranks=scaleout * ranks, qps=qps,
+                           scaleout_ranks=scaleout, scaleup_ranks=ranks,
+                           transport='hybrid_rdma_nvlink' if hybrid else 'nvlink' if nvlink else 'direct_rdma',
+                           entry_line=ins[lo].line + 1,
                            last_line=ins[hi].end + 1, exits=exits, interleaved_pure_lines=foreign,
                            detached_pure_lines=detached,
                            function=key[0]))
     result.sort(key=lambda s: s['entry_line'])
     tags = [s['tag'] for s in result]
-    if tags != {'dispatch': [2, 3], 'combine': [4, 5], 'barrier': [1]}[family]:
+    if tags != {'dispatch': [2, 3], 'hybrid_dispatch': [6, 7], 'combine': [4, 5], 'barrier': [1] * expected}[family]:
         raise BoundaryError(f'Unexpected tag order: {tags}')
     for i, site in enumerate(result):
         site['id'] = i
@@ -271,7 +285,12 @@ def resolve(text):
                 params=len(re.findall(r'\.param\b', entry[2])), sites=result,
                 record_bytes=RECORD_BYTES, slots=2 * len(result), map_level='thread',
                 thread_selection='all', thread_index='x + ntid.x * (y + ntid.y * z)',
-                measurement='per-thread barrier residence time', clocks='unsynchronized per GPU')
+                measurement='per-thread outer-barrier timestamp interval; wait completion unvalidated',
+                timestamp_ordering='unvalidated',
+                limitations=['Timer reads after BAR.SYNC.DEFER_BLOCKING may precede effective wait completion; '
+                             'record completeness and host alignment do not validate synchronization endpoints',
+                             'Outer gpu_barrier sites only; internal channel waits and epilogues are not traced'],
+                clocks='unsynchronized per GPU')
 
 
 def instrument(text, manifest):
@@ -279,6 +298,8 @@ def instrument(text, manifest):
     if '__nb_' in text:
         raise BoundaryError('Already instrumented')
     capacity = manifest['slots']
+    warp = manifest['thread_selection'] == 'warp'
+    block = manifest['thread_selection'] == 'block'
     inserts = {}
 
     def put(line, code):
@@ -287,9 +308,19 @@ def instrument(text, manifest):
     def record(site, kind, predicate=None):
         slot = site * 2 + kind
         pred = predicate + ' ' if predicate else ''
+        guard = ''
+        if warp or block:
+            if predicate:
+                source = predicate.removeprefix('@')
+                guard = (f'not.pred %__nb_edge, {source[1:]};\n' if source.startswith('!') else
+                         f'mov.pred %__nb_edge, {source};\n')
+                guard += 'and.pred %__nb_emit, %__nb_rep, %__nb_edge;\n'
+                pred = '@%__nb_emit '
+            else:
+                pred = '@%__nb_rep '
         offset = slot * RECORD_BYTES
         return f'''// Neutrino barrier {site} {'exit' if kind else 'entry'}
-{pred}mov.u64 %__nb_time, %globaltimer;
+{guard}{pred}mov.u64 %__nb_time, %globaltimer;
 {pred}ld.global.u32 %__nb_count, [%__nb_ptr+{offset + 16}];
 {pred}add.u32 %__nb_count, %__nb_count, 1;
 {pred}st.global.u64 [%__nb_ptr+{offset}], %__nb_time;
@@ -302,7 +333,16 @@ def instrument(text, manifest):
         for edge in site['exits']:
             before = edge['kind'] in ('taken', 'return')
             put(edge['line'] - 1 if before else edge['end_line'], record(site['id'], 1, edge['predicate']))
+    warp_declarations = '.reg .pred %__nb_rep, %__nb_edge, %__nb_emit;' if warp or block else ''
+    warp_index = '''and.b32 %__nb_x, %__nb_t, 31;
+setp.eq.u32 %__nb_rep, %__nb_x, 0;
+shr.u32 %__nb_t, %__nb_t, 5;
+add.u32 %__nb_n, %__nb_n, 31;
+shr.u32 %__nb_n, %__nb_n, 5;''' if warp else '''setp.eq.u32 %__nb_rep, %__nb_t, 0;
+mov.u32 %__nb_t, 0;
+mov.u32 %__nb_n, 1;''' if block else ''
     prolog = f'''
+{warp_declarations}
 .reg .b32 %__nb_x, %__nb_y, %__nb_z, %__nb_b, %__nb_n, %__nb_t, %__nb_count;
 .reg .b64 %__nb_ptr, %__nb_off, %__nb_time;
 mov.u32 %__nb_t, %tid.z;
@@ -324,6 +364,7 @@ mov.u32 %__nb_y, %ntid.y;
 mov.u32 %__nb_z, %ntid.z;
 mul.lo.u32 %__nb_n, %__nb_x, %__nb_y;
 mul.lo.u32 %__nb_n, %__nb_n, %__nb_z;
+{warp_index}
 mad.lo.u32 %__nb_b, %__nb_b, %__nb_n, %__nb_t;
 mul.wide.u32 %__nb_off, %__nb_b, {capacity * RECORD_BYTES};
 ld.param.u64 %__nb_ptr, [__nb_buffer];
@@ -342,7 +383,9 @@ add.u64 %__nb_ptr, %__nb_ptr, %__nb_off;
     return '\n'.join(output) + '\n'
 
 
-def prepare(cubin, workdir, assemble=True):
+def prepare(cubin, workdir, assemble=True, threads='all'):
+    if threads not in ('all', 'warp', 'block'):
+        raise BoundaryError('Unsupported thread selection')
     cubin, workdir = Path(cubin).resolve(), Path(workdir)
     ptx = cubin.with_suffix('.ptx')
     if not ptx.is_file():
@@ -352,6 +395,14 @@ def prepare(cubin, workdir, assemble=True):
         manifest = resolve(text)
     except BoundaryError as error:
         raise BoundaryError(f'{ptx}: {error}') from error
+    if threads == 'warp':
+        manifest.update(schema=3, map_level='warp', thread_selection='warp', record_group=32,
+                        representative_lane=0, warp_index='flattened_thread // 32',
+                        measurement='lane-0 outer-barrier timestamp interval per warp; wait completion unvalidated')
+    elif threads == 'block':
+        manifest.update(schema=4, map_level='block', thread_selection='block', record_group=0,
+                        representative_thread=0,
+                        measurement='thread-0 outer-barrier timestamp interval per block; wait completion unvalidated')
     manifest.update(artifact=str(cubin), artifact_sha256=hashlib.sha256(cubin.read_bytes()).hexdigest(),
                     ptx_sha256=hashlib.sha256(text.encode()).hexdigest(),
                     ptxas_options=['-arch=' + manifest['target'], '-O3', '-lineinfo',
@@ -386,7 +437,8 @@ def prepare(cubin, workdir, assemble=True):
         (workdir / 'ptxas.log').write_text(result.stdout + result.stderr)
         result.check_returncode()
     (workdir / 'sites.json').write_text(json.dumps(manifest, indent=2) + '\n')
-    (workdir / 'barrier.info').write_text(f"{manifest['params']} {manifest['slots']} {manifest['record_bytes']}\n{manifest['kernel']}\n")
+    (workdir / 'barrier.info').write_text(f"{manifest['params']} {manifest['slots']} {manifest['record_bytes']}\n"
+                                       f"{manifest['kernel']}\n{manifest.get('record_group', 1)}\n")
     return manifest
 
 
@@ -395,5 +447,6 @@ if __name__ == '__main__':
     parser.add_argument('cubin')
     parser.add_argument('workdir')
     parser.add_argument('--no-assemble', action='store_true')
+    parser.add_argument('--threads', choices=('all', 'warp', 'block'), default='all')
     args = parser.parse_args()
-    prepare(args.cubin, args.workdir, not args.no_assemble)
+    prepare(args.cubin, args.workdir, not args.no_assemble, args.threads)

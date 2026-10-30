@@ -94,7 +94,7 @@ def parse(text):
 
 def classify(opcode):
     parts = opcode.split('.')
-    if parts[0] == 'ld' and 'acquire' in parts:
+    if parts[0] in ('ld', 'atom') and 'acquire' in parts:
         return 'acquire'
     if parts[0] in ('st', 'red', 'atom') and any(p in parts for p in ('release', 'acq_rel')):
         return 'publication'
@@ -108,7 +108,15 @@ def classify(opcode):
         return 'proxy_fence_nonwaiting'
     if opcode.startswith(('bar.sync', 'barrier.sync', 'bar.warp.sync')):
         return 'local_barrier'
+    if parts[0] == 'membar' or (parts[0] == 'fence' and
+            any(p in parts for p in ('acquire', 'release', 'acq_rel', 'sc'))):
+        return 'memory_fence_nonwaiting'
     return None
+
+
+def memory_scope(opcode):
+    return next((p for p in re.split(r'\.|::', opcode)
+                 if p in ('sys', 'gpu', 'cta', 'cluster')), 'implicit')
 
 
 def cfg(instructions, labels):
@@ -224,34 +232,160 @@ def polling_loop(index, region, head, ins, edges, dom):
     return exit_depends and all(dom[s] & (1 << index) for s in latches)
 
 
-def resolve(text, capacity=256, waits='loop', threads='warp', local_barriers='exclude'):
+def episode_controls(region, head, ins, edges):
+    """Control dependencies for one acyclic loop iteration; reject nested cycles."""
+    sink = -1
+    successors = {node: set() for node in region}
+    indegree = dict.fromkeys(region, 0)
+    for src, dst, _, _ in edges:
+        if src in region:
+            successors[src].add(dst if dst in region and dst != head else sink)
+    for destinations in successors.values():
+        for dst in destinations - {sink}:
+            indegree[dst] += 1
+    pending = [node for node in region if not indegree[node]]
+    order = []
+    while pending:
+        node = pending.pop()
+        order.append(node)
+        for dst in successors[node] - {sink}:
+            indegree[dst] -= 1
+            if not indegree[dst]:
+                pending.append(dst)
+    if len(order) != len(region):
+        return None
+    post = {sink: {sink}}
+    for node in reversed(order):
+        post[node] = {node} | set.intersection(*(post[dst] for dst in successors[node]))
+    controls = {node: set() for node in region}
+    for src in region:
+        if len(successors[src]) > 1:
+            controlled = set.union(*(post[dst] for dst in successors[src])) - post[src] - {sink}
+            for node in controlled:
+                controls[node].add(src)
+    while True:
+        expanded = {node: parents | set().union(*(controls[p] for p in parents))
+                    for node, parents in controls.items()}
+        if expanded == controls:
+            break
+        controls = expanded
+    return {node: {ins[parent].predicate.lstrip('@!') for parent in parents if ins[parent].predicate}
+            for node, parents in controls.items()}
+
+
+def polling_episode(index, region, head, ins, edges):
+    """Recognize a single-signal, warp-cooperative wait without payload effects."""
+    inst = ins[index]
+    if not inst.opcode.startswith('ld.acquire.') or memory_scope(inst.opcode) != 'sys':
+        return False
+    if {d for s, d, _, _ in edges if s not in region and d in region} - {head}:
+        return False
+    address = re.search(r'\[([^]]+)\]', inst.operands)
+    result = re.match(REGISTER, inst.operands)
+    if not address or not result:
+        return False
+    address_regs = set(re.findall(REGISTER, address[1]))
+    controls = episode_controls(region, head, ins, edges)
+    if controls is None:
+        return False
+    dependencies = []
+    shuffles = []
+    has_warp_barrier = False
+    arithmetic = {'mov', 'cvt', 'cvta', 'add', 'sub', 'mul', 'mad', 'setp', 'selp',
+                  'and', 'or', 'xor', 'not', 'shl', 'shr', 'min', 'max', 'neg', 'abs'}
+    for i in sorted(region):
+        item = ins[i]
+        op = item.opcode
+        parts = op.split('.')
+        if op == 'bar.warp.sync':
+            has_warp_barrier = True
+            continue
+        if i != index and classify(op):
+            return False
+        if parts[0] in ('bra', 'ret', 'exit', 'trap'):
+            continue
+        if parts[0] == 'st' and set(parts) & {'local', 'param'}:
+            continue
+        if parts[0] == 'call' and re.match(r'(?:\([^)]*\)\s*,\s*)?vprintf\s*,', item.operands):
+            continue
+        private_load = parts[0] == 'ld' and set(parts) & {'local', 'param'}
+        if i != index and not (parts[0] in arithmetic or private_load or op == 'shfl.sync.idx.b32'):
+            return False
+        # Vector and paired-predicate destinations must all be considered writes.
+        operands = re.match(r'(\{[^}]*\}|[^,]+)(?:,\s*([\s\S]*))?$', item.operands)
+        if not operands:
+            return False
+        destinations = set(re.findall(REGISTER, operands[1]))
+        if destinations & address_regs:
+            return False
+        sources = set(re.findall(REGISTER, operands[2] or '')) | controls[i]
+        if item.predicate:
+            sources.add(item.predicate.lstrip('@!'))
+        dependencies.append((destinations, sources))
+        if op == 'shfl.sync.idx.b32':
+            shuffles.append((destinations, sources))
+    if not has_warp_barrier or not shuffles:
+        return False
+    dependent = {result[0]}
+    while True:
+        extended = dependent | set().union(*(dst for dst, src in dependencies if src & dependent), set())
+        if extended == dependent:
+            break
+        dependent = extended
+    # The polled value must pass through a shuffle and affect an exit condition.
+    shuffled = set().union(*(dst for dst, src in shuffles if src & dependent), set())
+    while True:
+        extended = shuffled | set().union(*(dst for dst, src in dependencies if src & shuffled), set())
+        if extended == shuffled:
+            break
+        shuffled = extended
+    return any(ins[s].predicate and ins[s].predicate.lstrip('@!') in shuffled
+               for s, d, _, _ in edges if s in region and d not in region)
+
+
+def resolve(text, capacity=256, waits='loop', threads='warp', local_barriers='exclude', sync_scope='all'):
     if (type(capacity) is not int or not 1 <= capacity <= 65536 or
-            waits not in ('loop', 'instruction') or threads not in ('all', 'warp') or
-            local_barriers not in ('include', 'exclude')):
+            waits not in ('loop', 'instruction', 'episode') or threads not in ('all', 'warp') or
+            local_barriers not in ('include', 'exclude') or sync_scope not in ('all', 'sys')):
         raise SyncError('Invalid synchronization capacity, selection, or probe mode')
+    if waits == 'episode' and (sync_scope != 'sys' or local_barriers != 'exclude'):
+        raise SyncError('Polling episodes require sys scope and excluded local-barrier probes')
     if '__ns_' in text:
         raise SyncError('Reserved probe prefix or already instrumented PTX')
     entry, ins, labels = parse(text)
     edges = cfg(ins, labels)
-    loops, dom = natural_loops(ins, edges) if waits == 'loop' else ({}, [])
+    loops, dom = natural_loops(ins, edges) if waits != 'instruction' else ({}, [])
     sites = []
     for i, inst in enumerate(ins):
         family = classify(inst.opcode)
-        if family is None or (family == 'local_barrier' and local_barriers == 'exclude'):
+        if (family is None or (family == 'local_barrier' and local_barriers == 'exclude') or
+                (sync_scope == 'sys' and memory_scope(inst.opcode) != 'sys')):
             continue
         matches = [(head, region) for head, region in loops.items() if i in region
                    and polling_loop(i, region, head, ins, edges, dom)]
         site = dict(id=len(sites), opcode=inst.opcode, instruction=inst.operands, ptx_line=inst.line,
                     category=family, type='instruction', instruction_index=i,
-                    scope=next((p for p in re.split(r'\.|::', inst.opcode)
-                                if p in ('sys', 'gpu', 'cta', 'cluster')), 'implicit'))
+                    scope=memory_scope(inst.opcode))
+        episode = False
+        if not matches and waits == 'episode':
+            matches = [(head, region) for head, region in loops.items() if i in region
+                       and polling_episode(i, region, head, ins, edges)]
+            episode = bool(matches)
         if matches:
             head, region = min(matches, key=lambda item: len(item[1]))
-            site.update(type='polling_loop', header=head, nodes=sorted(region),
+            site.update(type='polling_episode' if episode else 'polling_loop', header=head, nodes=sorted(region),
                         entry_edges=[list(e) for e in edges if e[0] not in region and e[1] in region],
                         exit_edges=[list(e) for e in edges if e[0] in region and e[1] not in region],
                         includes_calls=any(ins[node].opcode.startswith('call') for node in region))
+            if episode:
+                site.update(includes_warp_coordination=True,
+                    participants='Only lanes executing the selected acquire at least once in this episode',
+                    bounds='Loop entry to loop exit, including warp coordination and bookkeeping; zero-load episodes omitted')
         sites.append(site)
+    for site in sites:
+        if site['type'] == 'polling_episode' and any(
+                other['id'] != site['id'] and other['instruction_index'] in site['nodes'] for other in sites):
+            raise SyncError('Overlapping polling episode and selected probe')
     target = re.search(r'(?m)^\s*\.target\s+(sm_\w+)', text)
     if not target:
         raise SyncError('Missing architecture')
@@ -260,11 +394,13 @@ def resolve(text, capacity=256, waits='loop', threads='warp', local_barriers='ex
                 capacity=capacity, slots=capacity + 1, record_bytes=RECORD_BYTES,
                 thread_selection=threads, record_group=32 if threads == 'warp' else 1,
                 representative_lane=0 if threads == 'warp' else None,
-                waits=waits, local_barriers=local_barriers, identification='PTX opcodes and CFG only',
+                waits=waits, local_barriers=local_barriers, sync_scope=sync_scope,
+                identification='PTX opcodes and CFG only',
                 storage='per-warp header followed by bounded dynamic intervals' if threads == 'warp' else
                         'per-thread header followed by bounded dynamic intervals',
-                measurement='PTX instruction brackets and recognized polling-loop residence',
-                limitations=['No transport inference from PTX scope; validate NVLink externally',
+                measurement='PTX instruction brackets and recognized polling-loop/episode residence',
+                limitations=['No transport inference from PTX scope; validate transport externally',
+                             'Relaxed/volatile/MMIO signal protocols are not captured; not complete RDMA/NVLink synchronization',
                              'No API-level stream memory operations or implicit operand-dependency waits',
                              'No traversal into device callees; only the selected entry body',
                              'Unrecognized polling loops retain individual instruction attempts',
@@ -272,7 +408,12 @@ def resolve(text, capacity=256, waits='loop', threads='warp', local_barriers='ex
                              'Release/commit/fence brackets are not remote completion latency',
                              'Standalone acquire brackets are not whole protocol waits or payload completion',
                              'PTX boundaries undergo assembly scheduling; not exact isolated SASS latency'] +
-                           (['Local thread-barrier probes excluded; acquire/release and async completion/order probes retained']
+                           (['Cooperative polling episodes include internal warp synchronization/shuffles and bookkeeping',
+                             'Episode entry precedes the first load; only lanes that actually load emit an interval; zero-load episodes omitted']
+                            if waits == 'episode' else []) +
+                           (['Only explicit system-scope acquire/release/fence sites; GPU/grid/CTA and async probes excluded']
+                            if sync_scope == 'sys' else
+                            ['Local thread-barrier probes excluded; acquire/release and async completion/order probes retained']
                             if local_barriers == 'exclude' else []) +
                            (['Lane 0 represents each warp; sites skipped by lane 0 are not observed',
                              'Warp intervals are lane-0 residence, not earliest-lane entry to latest-lane exit']
@@ -285,6 +426,7 @@ def instrument(text, manifest):
     warp = manifest['thread_selection'] == 'warp'
     insertions = {}
     initial_probes = []
+    episodes = any(s['type'] == 'polling_episode' for s in manifest['sites'])
 
     def put(offset, code):
         insertions.setdefault(offset, []).append('\n' + code + '\n')
@@ -325,13 +467,20 @@ and.pred %__ns_write, %__ns_room, %__ns_guard;
             put(item.start, begin(site, item.predicate))
             put(item.end, end(site, saved_guard=True))
         else:
+            episode = site['type'] == 'polling_episode'
+            reset = '\n@%__ns_guard mov.pred %__ns_seen, 0;' if episode else ''
             if site['header'] == 0:
-                initial_probes.append(begin(site))
+                initial_probes.append(begin(site) + reset)
             for edge in site['entry_edges']:
-                edge_probe(edge, begin(site, edge[3]))
+                edge_probe(edge, begin(site, edge[3]) + reset)
+            if episode:
+                item = ins[site['instruction_index']]
+                put(item.start, guard(item.predicate) + '\n@%__ns_guard mov.pred %__ns_seen, 1;')
             for edge in site['exit_edges']:
                 if edge[2] != 'trap':
-                    edge_probe(edge, end(site, edge[3]))
+                    code = (guard(edge[3]) + '\nand.pred %__ns_guard, %__ns_guard, %__ns_seen;\n' +
+                            end(site, saved_guard=True)) if episode else end(site, edge[3])
+                    edge_probe(edge, code)
     grouping = '''and.b32 %__ns_x, %__ns_t, 31;
 setp.eq.u32 %__ns_lane0, %__ns_x, 0;
 shr.u32 %__ns_t, %__ns_t, 5;
@@ -343,6 +492,7 @@ shr.u32 %__ns_n, %__ns_n, 5;''' if warp else ''
 .reg .b32 %__ns_count, %__ns_calls, %__ns_done, %__ns_overflow;
 .reg .b64 %__ns_base, %__ns_offset, %__ns_record, %__ns_begin, %__ns_end, %__ns_total, %__ns_wide;
 .reg .pred %__ns_guard, %__ns_room, %__ns_write, %__ns_lane0;
+{'.reg .pred %__ns_seen;' if episodes else ''}
 mov.u32 %__ns_t, %tid.z;
 mov.u32 %__ns_n, %ntid.y;
 mov.u32 %__ns_y, %tid.y;
@@ -407,7 +557,8 @@ def prepare(cubin, workdir, assemble=True):
     manifest = resolve(text, int(os.environ.get('NEUTRINO_SYNC_CAPACITY', '256')),
                        os.environ.get('NEUTRINO_SYNC_WAITS', 'loop'),
                        os.environ.get('NEUTRINO_SYNC_THREADS', 'warp'),
-                       os.environ.get('NEUTRINO_SYNC_LOCAL_BARRIERS', 'exclude'))
+                       os.environ.get('NEUTRINO_SYNC_LOCAL_BARRIERS', 'exclude'),
+                       os.environ.get('NEUTRINO_SYNC_SCOPE', 'all'))
     level = int(os.environ.get('NEUTRINO_SYNC_REGISTER_LEVEL', '10'))
     if not 0 <= level <= 10:
         raise SyncError('Invalid PTXAS register usage level')
