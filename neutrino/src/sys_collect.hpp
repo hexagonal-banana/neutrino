@@ -11,12 +11,37 @@ inline void activity_check(CUptiResult result) {
 struct ActivityState {
     std::mutex mutex;
     bool initialized = false;
+    CUpti_SubscriberHandle subscriber{};
+    std::size_t callback_launches = 0;
     std::string error;
     std::size_t dropped = 0;
     std::map<std::uint32_t, std::uint64_t> correlations;
     std::vector<Json> kernels;
 };
 inline ActivityState& activity_state() { static auto* value = new ActivityState; return *value; }
+inline void record_correlation(ActivityState& activity, std::uint32_t correlation, std::uint64_t ordinal) {
+    auto inserted = activity.correlations.emplace(correlation, ordinal);
+    if (!inserted.second && inserted.first->second != ordinal)
+        throw ArgumentError("Conflicting CUPTI launch correlation");
+}
+inline void CUPTIAPI activity_launch_callback(void*, CUpti_CallbackDomain domain, CUpti_CallbackId, const void* raw) {
+    const auto ordinal = ActivityCorrelationScope::current();
+    if (!ordinal || domain != CUPTI_CB_DOMAIN_DRIVER_API) return;
+    const auto* info = static_cast<const CUpti_CallbackData*>(raw);
+    if (info->callbackSite != CUPTI_API_ENTER || !info->functionName) return;
+    const char* name = info->functionName;
+    if (std::strcmp(name, "cuLaunchKernel") && std::strcmp(name, "cuLaunchKernel_ptsz") &&
+        std::strcmp(name, "cuLaunchKernelEx") && std::strcmp(name, "cuLaunchKernelEx_ptsz") &&
+        std::strcmp(name, "cuLaunchCooperativeKernel") && std::strcmp(name, "cuLaunchCooperativeKernel_ptsz")) return;
+    // Nested runtime->driver calls can omit external-correlation activity records.
+    // The callback and kernel activity share this exact driver correlation ID.
+    // Never call CUDA, rewrite arguments, or submit work from this observer.
+    auto& activity = activity_state(); std::lock_guard<std::mutex> lock(activity.mutex);
+    try {
+        record_correlation(activity, info->correlationId, ordinal);
+        ++activity.callback_launches;
+    } catch (const std::exception& error) { activity.error = error.what(); }
+}
 inline std::uint64_t CUPTIAPI activity_timestamp() { return host_time(); }
 inline void CUPTIAPI activity_request(std::uint8_t** buffer, std::size_t* bytes, std::size_t* records) {
     *bytes = 8 * 1024 * 1024; *records = 0;
@@ -35,9 +60,7 @@ inline void CUPTIAPI activity_complete(CUcontext context, std::uint32_t stream,
             if (record->kind == CUPTI_ACTIVITY_KIND_EXTERNAL_CORRELATION) {
                 auto* r = reinterpret_cast<CUpti_ActivityExternalCorrelation*>(record);
                 if (r->externalKind != CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM0) continue;
-                auto inserted = a.correlations.emplace(+r->correlationId, +r->externalId);
-                if (!inserted.second && inserted.first->second != r->externalId)
-                    throw ArgumentError("Conflicting CUPTI launch correlation");
+                record_correlation(a, r->correlationId, r->externalId);
             } else if (record->kind == CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL) {
                 auto* r = reinterpret_cast<CUpti_ActivityKernel11*>(record);
                 a.kernels.push_back({{"kind", "kernel_activity"}, {"correlation", +r->correlationId},
@@ -76,14 +99,27 @@ inline void activity_flush(bool emit) {
             kernel["ordinal"] = correlation->second; kernel["step"] = s.step;
             s.log(kernel); expected.erase(found); ++matched;
         }
-        if (!expected.empty()) throw ArgumentError("Selected launch has no independent CUPTI kernel activity");
-        s.log({{"kind", "activity_validation"}, {"step", s.step}, {"matched", matched}, {"dropped", a.dropped}});
+        if (!expected.empty()) {
+            Json missing = Json::array(), candidates = Json::array();
+            for (const auto& item : expected) missing.push_back(item.second->metadata);
+            for (const auto& kernel : a.kernels)
+                if (std::any_of(expected.begin(), expected.end(), [&](const auto& item) {
+                    return item.second->metadata.at("kernel") == kernel.at("kernel");
+                })) candidates.push_back(kernel);
+            s.log({{"kind", "activity_coverage_error"}, {"step", s.step}, {"missing", missing},
+                   {"candidate_kernels", candidates}, {"correlations", a.correlations}});
+            throw ArgumentError("Selected launch has no independent CUPTI kernel activity");
+        }
+        s.log({{"kind", "activity_validation"}, {"step", s.step}, {"matched", matched}, {"dropped", a.dropped},
+               {"driver_callback_launches", a.callback_launches}});
     }
-    a.correlations.clear(); a.kernels.clear();
+    a.correlations.clear(); a.kernels.clear(); a.callback_launches = 0;
 }
 inline void initialize_activity() {
     auto& a = activity_state();
     if (!a.initialized) {
+        activity_check(cuptiSubscribe(&a.subscriber, activity_launch_callback, nullptr));
+        activity_check(cuptiEnableDomain(1, a.subscriber, CUPTI_CB_DOMAIN_DRIVER_API));
         activity_check(cuptiActivityRegisterTimestampCallback(activity_timestamp));
         activity_check(cuptiActivityRegisterCallbacks(activity_request, activity_complete));
         activity_check(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_EXTERNAL_CORRELATION));
@@ -288,7 +324,10 @@ template<class Submit> CUresult launch(CUfunction function, const Function* know
         // Original images and argument ABI: no hidden context or inserted GPU code.
         if (s.capturing && s.cupti)
             activity_check(cuptiActivityPushExternalCorrelationId(CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM0, ordinal));
-        const auto status = submit(parameters, extra);
+        const auto status = [&] {
+            ActivityCorrelationScope correlation(s.capturing && s.cupti ? ordinal : 0);
+            return submit(parameters, extra);
+        }();
         if (s.capturing && s.cupti) {
             std::uint64_t popped = 0;
             activity_check(cuptiActivityPopExternalCorrelationId(CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM0, &popped));
@@ -340,7 +379,10 @@ template<class Submit> CUresult launch(CUfunction function, const Function* know
     PreparedArguments args(*image->entries.at(descriptor.name), parameters, extra, device_context);
     // Original handles/configuration are retained. Never replay a submitted call.
     if (s.capturing) activity_check(cuptiActivityPushExternalCorrelationId(CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM0, ordinal));
-    const auto status = submit(args.parameters(), args.extra());
+    const auto status = [&] {
+        ActivityCorrelationScope correlation(s.capturing ? ordinal : 0);
+        return submit(args.parameters(), args.extra());
+    }();
     if (s.capturing) {
         std::uint64_t popped = 0;
         activity_check(cuptiActivityPopExternalCorrelationId(CUPTI_EXTERNAL_CORRELATION_KIND_CUSTOM0, &popped));

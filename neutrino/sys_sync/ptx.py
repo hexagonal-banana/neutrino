@@ -123,6 +123,7 @@ class Module:
 
 
 SITE_SELECTION = 'acquire_sys_system_fences_mbarrier_try_wait_v1'
+SITE_SELECTION_NO_MBARRIER = 'acquire_sys_system_fences_v1'
 
 
 def system_scope(opcode):

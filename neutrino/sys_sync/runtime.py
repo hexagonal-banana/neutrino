@@ -15,7 +15,7 @@ import sys
 from .build import load_reconstructed_group
 from .linkage import link_group
 from .probe import instrument_instructions, validate_loop_depth
-from .ptx import PTXError, SITE_SELECTION, parse
+from .ptx import PTXError, SITE_SELECTION, SITE_SELECTION_NO_MBARRIER, parse
 from .sampling import CONTEXT_ABI, policy_json
 from ..utils.reconstruct_cuda import disassembly, sha256
 
@@ -253,8 +253,15 @@ def runtime_environment(build_path, catalog_path, output, session, capture_polic
     for image in catalog['images']:
         if type(image.get('probe_enabled', True)) is not bool:
             raise PTXError('Image probe_enabled must be Boolean')
-        if capture_mode == 'full' and image['probe'].get('site_selection') != SITE_SELECTION:
+        selection = image['probe'].get('site_selection')
+        if capture_mode == 'full' and selection not in {SITE_SELECTION, SITE_SELECTION_NO_MBARRIER}:
             raise PTXError('Incompatible instruction coverage; rebuild transformed images')
+        if selection == SITE_SELECTION_NO_MBARRIER:
+            sites = [*image['probe'].get('sites', []), *(site for loop in image['probe'].get('loops', [])
+                      for site in loop.get('contained_sites', []))]
+            if any(site.get('operation') == 'mbarrier' or site.get('opcode', '').startswith('mbarrier.')
+                   for site in sites):
+                raise PTXError('Excluded mbarrier appears in probe coverage')
         if (type(image.get('context_abi')) is not int or image['context_abi'] != CONTEXT_ABI or
                 type(image['probe'].get('context_abi')) is not int or image['probe']['context_abi'] != CONTEXT_ABI or
                 image['probe'].get('sampling') != 'launch_policy'):

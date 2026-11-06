@@ -189,4 +189,17 @@ private:
     static inline thread_local std::size_t depth_ = 0;
 };
 
+// Exposes only the currently submitted selected launch to read-only CUPTI callbacks.
+class ActivityCorrelationScope {
+public:
+    explicit ActivityCorrelationScope(std::uint64_t ordinal) : previous_(current_) { current_ = ordinal; }
+    ~ActivityCorrelationScope() { current_ = previous_; }
+    ActivityCorrelationScope(const ActivityCorrelationScope&) = delete;
+    ActivityCorrelationScope& operator=(const ActivityCorrelationScope&) = delete;
+    static std::uint64_t current() { return current_; }
+private:
+    std::uint64_t previous_;
+    static inline thread_local std::uint64_t current_ = 0;
+};
+
 }  // namespace neutrino::sys

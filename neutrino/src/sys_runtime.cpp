@@ -77,8 +77,9 @@ extern "C" CUresult CUDAAPI cuLibraryLoadData(CUlibrary* library, const void* co
 }
 extern "C" CUresult CUDAAPI cuModuleGetFunction(CUfunction* function, CUmodule module, const char* name) {
     try {
+        SubmissionScope scope;
         auto result = NS_DRIVER(cuModuleGetFunction)(function, module, name);
-        if (enabled() && result == CUDA_SUCCESS) {
+        if (enabled() && scope.outermost() && result == CUDA_SUCCESS) {
             auto& s = state(); Lock lock(s.mutex); auto found = s.modules.find(module);
             if (found != s.modules.end()) bind_function(*function, found->second, name);
         }
@@ -87,8 +88,9 @@ extern "C" CUresult CUDAAPI cuModuleGetFunction(CUfunction* function, CUmodule m
 }
 extern "C" CUresult CUDAAPI cuModuleEnumerateFunctions(CUfunction* functions, unsigned count, CUmodule module) {
     try {
+        SubmissionScope scope;
         auto result = NS_DRIVER(cuModuleEnumerateFunctions)(functions, count, module);
-        if (enabled() && result == CUDA_SUCCESS) {
+        if (enabled() && scope.outermost() && result == CUDA_SUCCESS) {
             auto& s = state(); Lock lock(s.mutex); auto found = s.modules.find(module);
             if (found != s.modules.end()) {
                 unsigned actual = 0; check(NS_DRIVER(cuModuleGetFunctionCount)(&actual, module));
@@ -103,8 +105,9 @@ extern "C" CUresult CUDAAPI cuModuleEnumerateFunctions(CUfunction* functions, un
 }
 extern "C" CUresult CUDAAPI cuKernelGetFunction(CUfunction* function, CUkernel kernel) {
     try {
+        SubmissionScope scope;
         auto result = NS_DRIVER(cuKernelGetFunction)(function, kernel);
-        if (enabled() && result == CUDA_SUCCESS) {
+        if (enabled() && scope.outermost() && result == CUDA_SUCCESS) {
             auto& s = state(); Lock lock(s.mutex);
             CUlibrary library{}; check(NS_DRIVER(cuKernelGetLibrary)(&library, kernel));
             auto found = s.libraries.find(library);
@@ -118,8 +121,9 @@ extern "C" CUresult CUDAAPI cuKernelGetFunction(CUfunction* function, CUkernel k
 }
 extern "C" CUresult CUDAAPI cuLibraryGetModule(CUmodule* module, CUlibrary library) {
     try {
+        SubmissionScope scope;
         auto result = NS_DRIVER(cuLibraryGetModule)(module, library);
-        if (enabled() && result == CUDA_SUCCESS) {
+        if (enabled() && scope.outermost() && result == CUDA_SUCCESS) {
             auto& s = state(); Lock lock(s.mutex); auto found = s.libraries.find(library);
             if (found != s.libraries.end()) s.modules[*module] = found->second;
         }
@@ -202,8 +206,11 @@ extern "C" void __cudaUnregisterFatBinary(void** registration) {
 }
 extern "C" cudaError_t CUDARTAPI cudaGetFuncBySymbol(cudaFunction_t* function, const void* symbol) {
     try {
+        // Runtime materialization can enter driver lookup hooks for an already
+        // replaced image. Only the outer lookup owns its function association.
+        SubmissionScope scope;
         auto result = NS_RUNTIME(cudaGetFuncBySymbol)(function, symbol);
-        if (enabled() && result == cudaSuccess) {
+        if (enabled() && scope.outermost() && result == cudaSuccess) {
             auto& s = state(); Lock lock(s.mutex); auto found = s.host_functions.find(symbol);
             if (found != s.host_functions.end()) bind_function(*function, found->second.owner, found->second.name.c_str());
         }
@@ -286,7 +293,10 @@ static void redirect(void** pointer) {
     static const char* names[] = {"cuModuleLoad", "cuModuleLoadData", "cuModuleLoadDataEx", "cuModuleLoadFatBinary",
         "cuLibraryLoadFromFile", "cuLibraryLoadData", "cuModuleGetFunction", "cuModuleEnumerateFunctions", "cuKernelGetFunction",
         "cuLibraryGetModule", "cuModuleUnload", "cuLibraryUnload", "cuLaunchKernel", "cuLaunchKernel_ptsz",
-        "cuLaunchKernelEx", "cuLaunchKernelEx_ptsz", "cuLaunchCooperativeKernel", "cuLaunchCooperativeKernel_ptsz"};
+        "cuLaunchKernelEx", "cuLaunchKernelEx_ptsz", "cuLaunchCooperativeKernel", "cuLaunchCooperativeKernel_ptsz",
+        // A resolver can query itself (including a different ABI version).
+        // Returning the driver resolver here lets all subsequent lookups escape.
+        "cuGetProcAddress", "cuGetProcAddress_v2"};
     if (!enabled() || !pointer || !*pointer) return;
     for (const char* name : names) if (raw_symbol(driver_handle(), name) == *pointer) { *pointer = intercepted(name); return; }
 }

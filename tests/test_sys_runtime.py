@@ -134,6 +134,110 @@ extern "C" int fixture_run(const char* cubin, int reset) {
 '''
 
 
+RESOLVER_DRIVER = r'''
+#include <cuda.h>
+#include <cstring>
+#undef cuGetProcAddress
+extern "C" CUresult cuGetProcAddress(const char*, void**, int, cuuint64_t);
+extern "C" CUresult cuGetProcAddress_v2(const char*, void**, int, cuuint64_t, CUdriverProcAddressQueryResult*);
+extern "C" CUresult cuLibraryLoadData(CUlibrary*, const void*, CUjit_option*, void**, unsigned,
+                                     CUlibraryOption*, void**, unsigned) { return CUDA_ERROR_UNKNOWN; }
+extern "C" CUresult cuLaunchKernel(CUfunction, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned,
+                                  unsigned, CUstream, void**, void**) { return CUDA_ERROR_UNKNOWN; }
+extern "C" CUresult cuLaunchKernel_ptsz(CUfunction, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned,
+                                       unsigned, CUstream, void**, void**) { return CUDA_ERROR_UNKNOWN; }
+extern "C" void unhandled() {}
+static void* resolve(const char* name, int version, cuuint64_t flags) {
+    if (std::strcmp(name, "cuGetProcAddress") == 0)
+        return version >= 12000 ? reinterpret_cast<void*>(&cuGetProcAddress_v2) :
+                                  reinterpret_cast<void*>(&cuGetProcAddress);
+    if (std::strcmp(name, "cuLibraryLoadData") == 0) return reinterpret_cast<void*>(&cuLibraryLoadData);
+    if (std::strcmp(name, "cuLaunchKernel") == 0)
+        return flags == CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM ?
+            reinterpret_cast<void*>(&cuLaunchKernel_ptsz) : reinterpret_cast<void*>(&cuLaunchKernel);
+    if (std::strcmp(name, "unhandled") == 0) return reinterpret_cast<void*>(&unhandled);
+    return nullptr;
+}
+extern "C" CUresult cuGetProcAddress(const char* name, void** ptr, int version, cuuint64_t flags) {
+    if (auto found = resolve(name, version, flags)) { *ptr = found; return CUDA_SUCCESS; }
+    return CUDA_ERROR_NOT_FOUND;
+}
+extern "C" CUresult cuGetProcAddress_v2(const char* name, void** ptr, int version, cuuint64_t flags,
+                                      CUdriverProcAddressQueryResult* query) {
+    if (auto found = resolve(name, version, flags)) {
+        *ptr = found;
+        if (query) *query = CU_GET_PROC_ADDRESS_SUCCESS;
+    } else {
+        // Deliberately leave a recognizable pointer on failure to test the status gate.
+        *ptr = reinterpret_cast<void*>(&cuLibraryLoadData);
+        if (query) *query = CU_GET_PROC_ADDRESS_SYMBOL_NOT_FOUND;
+    }
+    return CUDA_SUCCESS;
+}
+'''
+
+RESOLVER_CHECK = r'''
+import ctypes as c
+import os
+api = c.CDLL(None)
+fake = c.CDLL(os.environ['NEUTRINO_REAL_DRIVER'])
+api.dlvsym.argtypes = [c.c_void_p, c.c_char_p, c.c_char_p]
+api.dlvsym.restype = c.c_void_p
+raw = c.CFUNCTYPE(c.c_void_p, c.c_void_p, c.c_char_p)(api.dlvsym(None, b'dlsym', b'GLIBC_2.2.5'))
+active = bool(os.environ.get('NEUTRINO_SYS_CATALOG'))
+def expected(name):
+    return c.cast(getattr(api, name), c.c_void_p).value if active else raw(fake._handle, name.encode())
+v1 = c.CFUNCTYPE(c.c_int, c.c_char_p, c.POINTER(c.c_void_p), c.c_int, c.c_uint64)
+v2 = c.CFUNCTYPE(c.c_int, c.c_char_p, c.POINTER(c.c_void_p), c.c_int, c.c_uint64, c.POINTER(c.c_int))
+def query(fn, modern, name, version, flags=0):
+    pointer, status = c.c_void_p(), c.c_int(-1)
+    args = [name.encode(), c.byref(pointer), version, flags]
+    if modern:
+        args.append(c.byref(status))
+    assert fn(*args) == 0
+    assert not modern or status.value == 0
+    return pointer.value
+for start, modern in ((v1(c.cast(api.cuGetProcAddress, c.c_void_p).value), False),
+                      (v2(c.cast(api.cuGetProcAddress_v2, c.c_void_p).value), True)):
+    for version, spelling, proto in ((11030, 'cuGetProcAddress', v1), (12000, 'cuGetProcAddress_v2', v2)):
+        pointer = query(start, modern, 'cuGetProcAddress', version)
+        assert pointer == expected(spelling), (modern, version, pointer, expected(spelling))
+        fn = proto(pointer)
+        for _ in range(3):
+            pointer = query(fn, version >= 12000, 'cuGetProcAddress', version)
+            assert pointer == expected(spelling)
+            fn = proto(pointer)
+        assert query(fn, version >= 12000, 'cuLibraryLoadData', 12000) == expected('cuLibraryLoadData')
+        for flags in (0, 1, 2):
+            name = 'cuLaunchKernel_ptsz' if flags == 2 else 'cuLaunchKernel'
+            assert query(fn, version >= 12000, 'cuLaunchKernel', 12000, flags) == expected(name)
+        assert query(fn, version >= 12000, 'unhandled', 12000) == raw(fake._handle, b'unhandled')
+pointer, status = c.c_void_p(raw(fake._handle, b'cuLibraryLoadData')), c.c_int(-1)
+assert v1(expected('cuGetProcAddress'))(b'absent', c.byref(pointer), 12000, 0) == 500
+assert pointer.value == raw(fake._handle, b'cuLibraryLoadData')
+assert v2(expected('cuGetProcAddress_v2'))(b'absent', c.byref(pointer), 12000, 0, c.byref(status)) == 0
+assert status.value == 1 and pointer.value == raw(fake._handle, b'cuLibraryLoadData')
+'''
+
+
+def check_resolver_chaining(root, build):
+    source, driver = root / 'resolver.cpp', root / 'resolver.so'
+    source.write_text(RESOLVER_DRIVER)
+    env = compiler_environment()
+    subprocess.run([os.environ['CXX'], '-std=c++17', '-shared', '-fPIC', '-Wl,-Bsymbolic-functions',
+                    '-I' + str(Path(os.environ['UNIFIED_TOOLCHAIN']) / 'targets/x86_64-linux/include'),
+                    str(source), '-o', str(driver)], env=env, check=True, timeout=60)
+    for active in (False, True):
+        child = {**env, 'LD_PRELOAD': build['library'], 'NEUTRINO_REAL_DRIVER': str(driver)}
+        if active:
+            # Resolver redirection does not initialize state or require a GPU/catalog read.
+            child['NEUTRINO_SYS_CATALOG'] = 'unused-resolver-test'
+        tested = subprocess.run([sys.executable, '-c', RESOLVER_CHECK], env=child,
+                                capture_output=True, text=True, timeout=30)
+        if tested.returncode:
+            raise AssertionError(f'Resolver chaining active={active}: {tested.stderr}')
+
+
 def compile_fixture(directory, *, jit_iterations=64, interval_mode='instruction-only', loop_depth=1,
                     jit_loop_depth=None, grid=(1, 1, 1), block=(32, 1, 1)):
     directory = Path(directory).resolve()
@@ -353,6 +457,70 @@ def validate_observation(output, mode, steps=(1,), ranks=(0,)):
 
 
 class RuntimeTests(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get('UNIFIED_TOOLCHAIN'), 'Selected toolchain required')
+    def test_driver_callback_correlation_without_cuda(self):
+        source = r'''
+#include "sys_collect.hpp"
+#include <cassert>
+#include <thread>
+using namespace neutrino::sys;
+int main() {
+    auto& activity = activity_state();
+    CUpti_CallbackData info{};
+    info.callbackSite = CUPTI_API_ENTER;
+    info.functionName = "cuLaunchKernelEx";
+    info.correlationId = 7;
+    auto callback = [&] { activity_launch_callback(nullptr, CUPTI_CB_DOMAIN_DRIVER_API, 0, &info); };
+    callback();
+    assert(activity.correlations.empty());
+    {
+        ActivityCorrelationScope outer(42);
+        assert(ActivityCorrelationScope::current() == 42);
+        info.callbackSite = CUPTI_API_EXIT; callback();
+        info.callbackSite = CUPTI_API_ENTER;
+        activity_launch_callback(nullptr, CUPTI_CB_DOMAIN_RUNTIME_API, 0, &info);
+        info.functionName = "cuMemAlloc_v2"; callback();
+        assert(activity.correlations.empty());
+        const char* names[] = {"cuLaunchKernel", "cuLaunchKernel_ptsz", "cuLaunchKernelEx",
+            "cuLaunchKernelEx_ptsz", "cuLaunchCooperativeKernel", "cuLaunchCooperativeKernel_ptsz"};
+        for (const auto* name : names) {
+            info.functionName = name; ++info.correlationId; callback();
+            assert(activity.correlations.at(info.correlationId) == 42);
+        }
+        assert(activity.callback_launches == 6);
+        record_correlation(activity, info.correlationId, 42);
+        assert(activity.error.empty());
+        try { ActivityCorrelationScope nested(51); throw 1; } catch (int) {}
+        assert(ActivityCorrelationScope::current() == 42);
+        std::thread other([&] {
+            assert(ActivityCorrelationScope::current() == 0);
+            ActivityCorrelationScope selected(99);
+            CUpti_CallbackData local = info; local.correlationId = 100;
+            activity_launch_callback(nullptr, CUPTI_CB_DOMAIN_DRIVER_API, 0, &local);
+        });
+        other.join();
+        assert(activity.correlations.at(100) == 99);
+        {
+            ActivityCorrelationScope conflicting(43); callback();
+        }
+        assert(activity.error == "Conflicting CUPTI launch correlation");
+    }
+    assert(ActivityCorrelationScope::current() == 0);
+}
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path, executable = root / 'correlation.cpp', root / 'correlation'
+            path.write_text(source)
+            repo = Path(__file__).resolve().parents[1]
+            toolchain = Path(os.environ['UNIFIED_TOOLCHAIN'])
+            command = [os.environ['CXX'], '-std=c++17', '-O2', '-pthread', '-Wall', '-Wextra', '-Werror',
+                       '-Wno-deprecated-declarations', '-I' + str(repo / 'neutrino/src'),
+                       '-I' + str(repo.parent / 'third_party/nccl-unified/contrib/nccl_m2n/third_party'),
+                       '-I' + str(toolchain / 'targets/x86_64-linux/include'), str(path), '-o', str(executable)]
+            subprocess.run(command, env=compiler_environment(), check=True, timeout=90)
+            subprocess.run([str(executable)], env=compiler_environment(), check=True, timeout=30)
+
     def test_independent_jit_depth_and_catalog_validation(self):
         from neutrino.sys_sync.ptx import PTXError, SITE_SELECTION
         for mode, default in (('instruction-only', 1), ('loop-boundary', 3)):
@@ -462,6 +630,7 @@ class RuntimeTests(unittest.TestCase):
             code = 'import ctypes; assert ctypes.CDLL(None).neutrinoSysAbiVersion() == 0'
             subprocess.run([sys.executable, '-c', code], env=env, check=True, timeout=30)
             self.assertEqual(sha256(report['library']), report['sha256'])
+            check_resolver_chaining(Path(temporary), report)
             catalog = Path(temporary) / 'catalog.json'
             catalog.write_text(json.dumps({'schema': 1, 'context_abi': CONTEXT_ABI, 'interval_mode': 'instruction-only', 'images': []}))
             settings = runtime_environment(Path(temporary) / 'build/build.json', catalog,
@@ -480,6 +649,25 @@ class RuntimeTests(unittest.TestCase):
                 with self.assertRaisesRegex(PTXError, 'instruction coverage'):
                     runtime_environment(Path(temporary) / 'build/build.json', catalog,
                                         Path(temporary) / 'stale', 'cpu-test')
+            from neutrino.sys_sync.ptx import SITE_SELECTION_NO_MBARRIER
+            replacement = Path(temporary) / 'selection.cubin'
+            replacement.write_bytes(b'catalog-validation-only')
+            image = {'context_abi': CONTEXT_ABI, 'label': 'MoonEP', 'interval_mode': 'instruction-only',
+                     'replacement': str(replacement), 'replacement_sha256': sha256(replacement),
+                     'probe': {'context_abi': CONTEXT_ABI, 'sampling': 'launch_policy',
+                               'site_selection': SITE_SELECTION_NO_MBARRIER, 'sites': []}}
+            stale['images'] = [image]
+            catalog.write_text(json.dumps(stale))
+            runtime_environment(Path(temporary) / 'build/build.json', catalog, Path(temporary) / 'no-mbarrier', 'cpu-test')
+            for container in ('sites', 'loops'):
+                image['probe']['sites'] = []
+                image['probe']['loops'] = []
+                barrier = {'opcode': 'mbarrier.try_wait.shared.b64'}
+                image['probe'][container] = [barrier] if container == 'sites' else [{'contained_sites': [barrier]}]
+                catalog.write_text(json.dumps(stale))
+                with self.assertRaisesRegex(PTXError, 'Excluded mbarrier'):
+                    runtime_environment(Path(temporary) / 'build/build.json', catalog,
+                                        Path(temporary) / 'invalid-selection', 'cpu-test')
             child = {**compiler_environment(), 'PYTHONPATH': settings['PYTHONPATH']}
             child.pop('LD_PRELOAD', None)
             subprocess.run([sys.executable, '-c', 'import neutrino.sys_sync.runtime'], cwd=temporary,

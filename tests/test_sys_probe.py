@@ -31,6 +31,41 @@ def instrument(source, mode='instruction-only'):
 
 
 class ProbeTests(unittest.TestCase):
+    def test_mbarrier_exclusion_preserves_code_and_removes_barrier_only_loops(self):
+        from neutrino.sys_sync.ptx import SITE_SELECTION_NO_MBARRIER
+        source = HEADER + '''.entry k() {
+ .reg .pred %p; .reg .b32 %addr; .reg .b64 %state;
+ L: mbarrier.try_wait.shared.b64 %p, [%addr], %state; @!%p bra L;
+ membar.sys; ret;
+}'''
+        group = link_group({'module': source})
+        for mode in ('instruction-only', 'loop-boundary'):
+            settings = dict(max_parameter_bytes=32764, interval_mode=mode)
+            default = instrument_instructions(group, **settings)
+            self.assertEqual(default, instrument_instructions(group, mbarrier='include', **settings))
+            result = instrument_instructions(group, mbarrier='exclude', **settings)
+            self.assertEqual(result.manifest['site_selection'], SITE_SELECTION_NO_MBARRIER)
+            self.assertEqual([s['opcode'] for s in result.manifest['sites']], ['membar.sys'])
+            self.assertFalse(result.manifest.get('loops'))
+            self.assertEqual(group.modules['module'].sites, parse(source).sites)
+            for function in parse(source).functions:
+                for instruction in function.instructions:
+                    self.assertIn(source[instruction.start:instruction.end], result.sources['module'])
+            self.assertEqual(instrument_instructions(group, **settings), default)
+        with self.assertRaisesRegex(PTXError, 'mbarrier'):
+            instrument_instructions(group, max_parameter_bytes=32764,
+                                    interval_mode='instruction-only', mbarrier='invalid')
+
+    def test_mbarrier_only_image_retains_entry_completion_without_records(self):
+        source = HEADER + '.entry k() { .reg .pred %p; .reg .b32 %a; ' \
+            'mbarrier.try_wait.parity.shared.b64 %p, [%a], 0; ret; }'
+        result = instrument_instructions(link_group({'module': source}), max_parameter_bytes=32764,
+                                         interval_mode='loop-boundary', mbarrier='exclude')
+        self.assertEqual(result.manifest['sites'], [])
+        self.assertEqual(result.manifest['loops'], [])
+        self.assertIn('state+8], 1;', result.sources['module'])
+        self.assertNotIn('%globaltimer', result.sources['module'])
+
     def test_original_system_instructions_and_predicates_remain_exact(self):
         source = HEADER + '''
 .entry k(.param .u64 ptr) {

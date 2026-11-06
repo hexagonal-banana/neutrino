@@ -3,13 +3,13 @@
 Loop boundaries follow exact CFG edges without inferring polling success.
 Neither mode asserts remote arrival, consumption, or hardware completion.
 """
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import hashlib
 import json
 
 from .context import ContextRewrite, PREFIX, REGISTER, insertions, propagate_context
 from .control_flow import analyze
-from .ptx import PTXError, SITE_SELECTION
+from .ptx import PTXError, SITE_SELECTION, SITE_SELECTION_NO_MBARRIER
 from .records import COMMITTED, RECORD, SCHEMA, STARTED, STATE
 from .sampling import CONTEXT_ABI
 
@@ -273,12 +273,19 @@ and.pred {P}room, {P}active, {label}room;
 
 
 def instrument_instructions(group, *, max_parameter_bytes, interval_mode, record_storage='per-thread-v1',
-                            loop_depth=1):
+                            loop_depth=1, mbarrier='include'):
     if record_storage not in {'per-thread-v1', 'pooled-v1'}:
         raise PTXError('Unknown recording storage')
     if interval_mode not in {'instruction-only', 'loop-boundary'}:
         raise PTXError('Expected instruction-only or loop-boundary mode')
     validate_loop_depth(interval_mode, loop_depth)
+    if mbarrier not in {'include', 'exclude'}:
+        raise PTXError('Unknown mbarrier probe selection')
+    if mbarrier == 'exclude':
+        # Filter static candidates before loop selection; retain every original instruction.
+        group = replace(group, modules={unit: replace(module, sites=tuple(
+            site for site in module.sites if site.operation != 'mbarrier'))
+            for unit, module in group.modules.items()})
     context = propagate_context(group, max_parameter_bytes=max_parameter_bytes)
     edits = {unit: list(values) for unit, values in context.edits.items()}
     sites, by_function = [], {}
@@ -316,7 +323,8 @@ def instrument_instructions(group, *, max_parameter_bytes, interval_mode, record
     sources = {unit: insertions(source, edits[unit]) for unit, source in group.sources.items()}
     manifest = {**context.manifest, 'kind': ('system_loop_and_instruction_intervals' if loops else
                                           'system_instruction_brackets'), 'site_instrumentation': True,
-                'interval_mode': interval_mode, 'site_selection': SITE_SELECTION,
+                'interval_mode': interval_mode,
+                'site_selection': SITE_SELECTION if mbarrier == 'include' else SITE_SELECTION_NO_MBARRIER,
                 'polling_intervals_validated': False,
                 'sass_timer_placement_validated': False, 'sampling': 'launch_policy',
                 'context_abi': CONTEXT_ABI, 'supported_sampling': ['all', 'warp', 'block'],
