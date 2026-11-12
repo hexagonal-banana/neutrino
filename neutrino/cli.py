@@ -50,10 +50,20 @@ def main():
                         help="enable benchmark mode to evaluate overhead w.r.t. the original kernel")
     parser.add_argument('--memusage', action='store_true', 
                         help="prevent the profiling and only measure the memory usage")
+    parser.add_argument('--buffer-mb', type=int, default=128,
+                        help="total resident device-plus-pinned-host function-probe pool budget in MiB")
+    parser.add_argument('--pool-prewarm', type=int, default=8,
+                        help="preallocated slots per new function-probe buffer capacity class")
+    parser.add_argument('--timestamp-only', action='store_true',
+                        help="retired mapped-host experiment (rejected; use ordinary probe maps)")
     # put command at the end of command
     parser.add_argument("command", nargs=argparse.REMAINDER) 
     # parse the arguments
     args = parser.parse_args()
+    if args.buffer_mb <= 0:
+        parser.error("--buffer-mb must be positive")
+    if not 1 <= args.pool_prewarm <= 1024:
+        parser.error("--pool-prewarm must be between 1 and 1024")
     
     # same as this executable
     NEUTRINO_PYTHON: str = args.python # default to be this executable
@@ -69,8 +79,11 @@ def main():
     # Path to the real driver
     NEUTRINO_REAL_DRIVER: str = args.driver
     # command to be executed
-    command: str = args.command
-    assert len(command) > 0, "Command must be specified"
+    command = args.command
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        parser.error("Command must be specified")
     
     # Parse the PROBE
     NEUTRINO_PROBE_PATH: str = args.probe
@@ -92,6 +105,17 @@ def main():
             source = open(os.path.join(NEUTRINO_TOOLS_DIR, NEUTRINO_TOOLS[NEUTRINO_PROBE_PATH]), "r").read()
             NEUTRINO_PROBE = compile(NEUTRINO_MODE, source)
             
+    from neutrino.common import load
+    probes, _, _ = load(NEUTRINO_PROBE)
+    function_mode = any(probe.funcname is not None for probe in probes)
+    if function_mode and NEUTRINO_MODE != "CUDA":
+        parser.error("Function probes currently require CUDA")
+    if function_mode and (args.benchmark or args.memusage):
+        parser.error("Function probes require single execution; --benchmark and --memusage are unsupported")
+
+    if args.timestamp_only or NEUTRINO_PROBE.get("function_trace_layout", "events") != "events":
+        parser.error("The mapped-host --timestamp-only experiment is retired; use ordinary Neutrino probe maps")
+
     # NOTE generate the trace reading code
     from neutrino.utils.trace_reading import gen_reading_code
     NEUTRINO_READING = gen_reading_code(NEUTRINO_PROBE)
@@ -124,6 +148,10 @@ def main():
     env["NEUTRINO_KERNEL"]       = NEUTRINO_KERNEL
     env["NEUTRINO_TRACEDIR"]     = NEUTRINO_TRACEDIR
     env["NEUTRINO_PROBES"]       = toml.dumps(NEUTRINO_PROBE) # dump it to string
+    env["NEUTRINO_FUNCTION_PROBE_ABI"] = "1" if function_mode else "0"
+    env["NEUTRINO_BUFFER_BYTES"] = str(args.buffer_mb * 1024 * 1024)
+    env["NEUTRINO_POOL_PREWARM"] = str(args.pool_prewarm)
+    env["NEUTRINO_COLLECTION_BACKEND"] = "cuda-device-maps-event-async-dtoh-pool" if function_mode else ""
     # GNU LD_PRELOAD to overwrite dlopen, https://man7.org/linux/man-pages/man8/ld.so.8.html
     env["LD_PRELOAD"]            = os.path.join(NEUTRINO_BUILD_DIR, "preload.so")
     # Add to the LD_LIBRARY_PATH, this would overwrite ldconfig
@@ -139,8 +167,7 @@ def main():
     env["NEUTRINO_MEMUSAGE"]     = NEUTRINO_MEMUSAGE
     # An Environmental Variables to enable the debug mode -> more messages
     # env["NEUTRINO_VERBOSE"] = "1"
-    if NEUTRINO_DYNAMIC:
-        env["NEUTRINO_DYNAMIC"]  = "1"
+    env["NEUTRINO_DYNAMIC"] = "1" if NEUTRINO_DYNAMIC and not function_mode else "0"
     if NEUTRINO_READING:
         env["NEUTRINO_READING"]  = NEUTRINO_READING
     if NEUTRINO_CALLBACK:
@@ -157,9 +184,10 @@ def main():
         env["NEUTRINO_PROBING_PY"] = os.path.join(NEUTRINO_PROBE_DIR, "hip.py")
 
     # start the program with new environment
-    if len(command) > 0:
-        proc = subprocess.Popen(command, env=env)
-        proc.wait()
+    os.makedirs(NEUTRINO_TRACEDIR, exist_ok=True)
+    proc = subprocess.Popen(command, env=env)
+    result = proc.wait()
+    return result if result >= 0 else 128 - result
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

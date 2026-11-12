@@ -36,6 +36,7 @@ elif check_command("nvidia-smi"):
     NEUTRINO_IMPL_SRC = "cuda.c"
     NEUTRINO_HOOK_DRIVER_LIB_NAME = "libcuda.so.1"
     NEUTRINO_DRIVER_HEADER_SEARCH_PATH = [
+        os.path.join(os.environ.get("CUDA_HOME", "/usr/local/cuda"), "include"),
         "/usr/local/cuda/targets/x86_64-linux/include/", # for x86
         "/usr/local/cuda/targets/aarch64-linux/include/", # for ARM
         # add if missed
@@ -50,39 +51,44 @@ BUILD_DIR = os.path.join(CURDIR, "build")
 CC = "cc" # NOTE don't use nvcc or hipcc, need gcc or clang
 PY = sys.executable
 
-for dir_ in NEUTRINO_DRIVER_HEADER_SEARCH_PATH:
-    try:
-        if NEUTRINO_DRIVER_HEADER_NAME in os.listdir(dir_):
-          break
-    except:
-        pass
-# NOTE this will be written in config.toml
-NEUTRINO_DRIVER_HEADER_DIR = dir_
+NEUTRINO_DRIVER_HEADER_DIR = next(
+    (directory for directory in NEUTRINO_DRIVER_HEADER_SEARCH_PATH
+     if os.path.isfile(os.path.join(directory, NEUTRINO_DRIVER_HEADER_NAME))), None)
+if NEUTRINO_DRIVER_HEADER_DIR is None:
+    raise RuntimeError(f"Driver header {NEUTRINO_DRIVER_HEADER_NAME} was not found")
 
 # NOTE Locate Driver Shared Library
 # inspired by: https://github.com/triton-lang/triton/commit/58c54455ffa691be64f90f4e856501162373572c#diff-3d1f29795218f61553ab953426c15fa1e4162b224405b85529022293054da57aR25
 # but we need to further locate the real driver library
 libs = subprocess.check_output(["/sbin/ldconfig", "-p"]).decode()
 locs = [line.split()[-1] for line in libs.splitlines() if NEUTRINO_HOOK_DRIVER_LIB_NAME in line]
-env_ld_library_path = os.getenv("LD_LIBRARY_PATH")
-if env_ld_library_path and not locs:
-    locs = [os.path.join(dir_, NEUTRINO_HOOK_DRIVER_LIB_NAME) for dir_ in env_ld_library_path.split(":")
-            if os.path.exists(os.path.join(dir_, NEUTRINO_HOOK_DRIVER_LIB_NAME))]
-
-# try to locate the pointed path
-NEUTRINO_REAL_DRIVER_LIB_NAME = ""
-NEUTRINO_REAL_DRIVER_LIB_DIR = ""
-real_libs = []
-for loc in locs:
-    real_lib = os.readlink(loc)
-     # NOTE fix lib32 and i386 bug
-    if "lib32" not in loc and "lib32" not in real_lib and "i386" not in loc and "i386" not in real_lib:
-        if not real_lib.startswith("/"):
+env_ld_library_path = os.getenv("LD_LIBRARY_PATH", "")
+if NEUTRINO_MODE == "CUDA":
+    # CUDA compatibility drivers take precedence over the system ldconfig entry.
+    # Resolve the actual image so preload never redirects this path to our hook.
+    locs = [os.path.join(directory, NEUTRINO_HOOK_DRIVER_LIB_NAME)
+            for directory in env_ld_library_path.split(":") if directory] + locs
+    if os.getenv("NEUTRINO_REAL_DRIVER"):
+        locs.insert(0, os.environ["NEUTRINO_REAL_DRIVER"])
+    hook = os.path.realpath(os.path.join(BUILD_DIR, NEUTRINO_HOOK_DRIVER_LIB_NAME))
+    real_driver = next((os.path.realpath(path) for path in locs
+                        if os.path.isfile(path) and os.path.realpath(path) != hook
+                        and not any(part in path or part in os.path.realpath(path)
+                                    for part in ("lib32", "i386"))), None)
+    if real_driver is None:
+        raise RuntimeError("A real CUDA driver was not found")
+    NEUTRINO_REAL_DRIVER_LIB_DIR, NEUTRINO_REAL_DRIVER_LIB_NAME = os.path.split(real_driver)
+else:
+    if env_ld_library_path and not locs:
+        locs = [os.path.join(dir_, NEUTRINO_HOOK_DRIVER_LIB_NAME) for dir_ in env_ld_library_path.split(":")
+                if os.path.exists(os.path.join(dir_, NEUTRINO_HOOK_DRIVER_LIB_NAME))]
+    NEUTRINO_REAL_DRIVER_LIB_NAME = ""
+    NEUTRINO_REAL_DRIVER_LIB_DIR = ""
+    for loc in locs:
+        real_lib = os.readlink(loc)
+        if "lib32" not in loc and "lib32" not in real_lib and "i386" not in loc and "i386" not in real_lib:
             NEUTRINO_REAL_DRIVER_LIB_DIR = os.path.dirname(loc)
-            NEUTRINO_REAL_DRIVER_LIB_NAME = real_lib
-        else:
-            NEUTRINO_REAL_DRIVER_LIB_DIR = os.path.dirname(loc)
-            NEUTRINO_REAL_DRIVER_LIB_NAME = os.path.basename(loc)
+            NEUTRINO_REAL_DRIVER_LIB_NAME = real_lib if not real_lib.startswith("/") else os.path.basename(loc)
 
 print(NEUTRINO_REAL_DRIVER_LIB_DIR, NEUTRINO_REAL_DRIVER_LIB_NAME, file=sys.stderr)
 

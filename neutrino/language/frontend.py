@@ -47,8 +47,8 @@ class NeutrinoVisitor(ast.NodeVisitor):
     def visit_Assign(self, node): # Lowered to mov 
         # we shall check if the target has a known name
         name = self.reg_map[node.targets[0].id]
-        if isinstance(node.value, ast.Attribute):
-            self.ir.append(["mov", name, self.visit(node.value)])
+        if isinstance(node.value, (ast.Attribute, ast.Constant)):
+            self.ir.append(["mov", name, self.process_operand(node.value)])
         else:
             new_name = self.visit(node.value) # this is the temporary name
             for inst in self.ir:
@@ -133,14 +133,7 @@ class NeutrinoVisitor(ast.NodeVisitor):
             map_name = node.func.value.id
             if map_name not in self.maps:
                 raise ValueError(f"Map {map_name} not found, known maps: {self.maps}")            
-            regs = []
-            for arg in node.args:
-                if isinstance(arg, ast.Name):
-                    regs.append(self.reg_map[arg.id])
-                elif isinstance(arg, ast.Attribute):
-                    regs.append(self.visit_Attribute(arg))
-                else:
-                    regs.append(self.reg_map[self.visit(arg)])
+            regs = [self.process_operand(arg) for arg in node.args]
             self.ir.append(["SAVE", map_name] + regs)
         else:
             raise NotImplementedError()
@@ -150,6 +143,10 @@ class NeutrinoVisitor(ast.NodeVisitor):
 
     def visit_Attribute(self, node):
         if node.value.id == self.nl_name or node.value.id in self.maps:
+            if node.attr == "site_id":
+                return "SITE_ID"
+            if node.attr == "event":
+                return "EVENT_KIND"
             if node.attr in ("bytes", "addr", "out", "in1", "in2", "in3"):
                 return node.attr.upper()
             return node.attr
@@ -165,7 +162,7 @@ class NeutrinoVisitor(ast.NodeVisitor):
         super().generic_visit(node)
 
 
-def parse(code: str) -> tuple[list[Register], list[Probe], list[Map], str]:
+def parse(code: str, *, register_descriptions=None) -> tuple[int, list[Probe], list[Map], str]:
     """Parse the code into probes"""
     tree = ast.parse(code)
     nl_name:  str = None # name of neutrino.language in the code
@@ -185,7 +182,10 @@ def parse(code: str) -> tuple[list[Register], list[Probe], list[Map], str]:
                 raise ValueError("CALLBACK must be a string constant")
         elif type(node) is ast.AnnAssign and node.annotation:
             if node.annotation.value.id == nl_name and node.annotation.attr in TYPES:
-                regs.append(Register(node.target.id, node.annotation.attr, node.value.value)) 
+                initial = ast.literal_eval(node.value) if node.value is not None else 0
+                if type(initial) is not int:
+                    raise ValueError("Register initializers must be integers")
+                regs.append(Register(node.target.id, node.annotation.attr, initial))
         elif type(node) is ast.ClassDef and node.decorator_list:
             name = node.name # take class name as map name
             decorator = node.decorator_list[0]
@@ -218,16 +218,26 @@ def parse(code: str) -> tuple[list[Register], list[Probe], list[Map], str]:
             name = node.name # take func name as probe name
             decorator = node.decorator_list[0]
             if decorator.func.id == "probe":
-                pos, level, before = None, None, False
+                pos, level, before, funcname = None, "thread", False, None
+                if decorator.args:
+                    if len(decorator.args) > 4:
+                        raise ValueError("probe accepts at most four positional arguments")
+                    positional = dict(zip(("pos", "after", "level", "size"),
+                                          (ast.literal_eval(arg) for arg in decorator.args)))
+                    pos = positional.get("pos")
+                    level = positional.get("level", level)
+                    if any(k.arg in positional for k in decorator.keywords):
+                        raise ValueError("Duplicate positional and keyword probe arguments")
                 for keyword in decorator.keywords:
                     if   keyword.arg == "pos":       pos = keyword.value.value
                     elif keyword.arg == "level":     level = keyword.value.value
                     elif keyword.arg == "before":    before = keyword.value.value
+                    elif keyword.arg == "funcname":  funcname = keyword.value.value
                 if not pos or not level: raise ValueError("position must be specified")
                 # check if probe existed or not
                 visitor = NeutrinoVisitor(nl_name=nl_name, regs=[reg.name for reg in regs], maps=[map.name for map in maps])
                 visitor.visit(ast.Module(body=node.body)) # Take it as independent code
-                probe = Probe(name=name, pos=pos, level=level)
+                probe = Probe(name=name, pos=pos, level=level, funcname=funcname)
                 if before:
                     probe.before = visitor.ir
                 else:
@@ -235,6 +245,8 @@ def parse(code: str) -> tuple[list[Register], list[Probe], list[Map], str]:
                 probes.append(probe)
                 num_regs = max(num_regs, visitor.reg_counter)
     
+    if register_descriptions is not None:
+        register_descriptions.extend(regs)
     return num_regs + len(regs), probes, maps, callback
 
 # A Simple Test Case, not really used in production

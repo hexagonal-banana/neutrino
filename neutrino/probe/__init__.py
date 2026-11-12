@@ -13,6 +13,8 @@ class Ref:
     line: str          # Original line
     probe: str         # Probe name for matchine
     before_after: bool # True if before and False if after -> to distinguish which snippet is used
+    site_id: int | None = None
+    event: int | None = None
 
 
 @dataclass

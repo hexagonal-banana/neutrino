@@ -1,6 +1,7 @@
 """Neutrino Probing Engine, CUDA Implementation"""
 
 import os
+import re
 import sys
 import shutil
 import subprocess
@@ -8,9 +9,9 @@ import traceback # usef for print backtrace to log file instead of stdout
 import toml      # to load probes from envariables
 from neutrino.common import Register, Probe, Map, load
 from neutrino.probe import Ref, KernelParam
+from neutrino.probe.ptx_payload import emit_save
 
-workdir = sys.argv[1]     # directory contains original.bin
-log = open(os.path.join(workdir, "process.log"), 'w')
+log = sys.stderr
 
 # a macro like terms
 SUPPORTED_DATAMODEL = { "thread": 0, "warp": 1 }
@@ -241,6 +242,7 @@ setp.eq.u32 %leader, %warpbuf2, 0;          // check if thread is warp leader
 @%leader mad.lo.s32 %warpbuf17, %warpbuf16, %warpbuf12, %warpbuf9;  // block_idx = (gridDim.y * blockIdx.z + blockIdx.y) * gridDim.x + blockIdx.x
 @%leader mul.lo.s32 %warpbuf19, %warpbuf7, %warpbuf8;
 @%leader mul.lo.s32 %warpbuf20, %warpbuf19, %warpbuf18;
+@%leader add.s32 %warpbuf20, %warpbuf20, 31;
 @%leader div.s32 %warpbuf20, %warpbuf20, 32;
 @%leader mad.lo.s32 %warpbuf1,  %warpbuf17, %warpbuf20,  %warpbuf15; // buf_idx = block_idx * warpSize + warpIdx
 // end buffer calculation"""
@@ -302,8 +304,13 @@ level = "thread"
 before = "add.u64 %NR0, %NR0, {count_size};"
 """
 
-def probing(asm: str, probes: list[Probe], maps: list[Map], regs: int) -> tuple[str, list[int]]:
-    """Process the probes, the core function of probing engine"""
+def probing(asm: str, probes: list[Probe], maps: list[Map], regs: int, *,
+            references=None, registers=(), declarations="") -> str:
+    """Lower either opcode-selected or explicit line references with one backend.
+
+    Explicit references replace zero-based source lines. Selection adapters remove
+    their marker framing before calling this function; no CFG is needed here.
+    """
 
     # NOTE parse interesting locations
     # A mapping from location to probes, a probe can hook at multiple location
@@ -370,12 +377,14 @@ def probing(asm: str, probes: list[Probe], maps: list[Map], regs: int) -> tuple[
                                 if probe.after is not None:
                                     ptx_lines.insert(line_idx + 1, Ref(line=line, probe=probe, before_after=False))
                                     idx += 1
+        if references is not None and idx in references:
+            ptx_lines[idx] = references[idx]
         idx += 1
 
     # Now add the probes to PTX Assembly
     offset: int = 0 # adding every line need to offset 1 to make it correct
     # First let's add parameters
-    ptx_lines[param_end_line] = ptx_lines[param_end_line] + "," # add , to indicate more param
+    # Insert at the signature terminator, also supporting an empty signature.
     # NOTE parameter layouts: Parameters are pointers to buffer, or buffer size
     # We arange buffer pointers linearly in advance (u64), and later size (u32)
     params_added: list[str] = []
@@ -399,10 +408,22 @@ def probing(asm: str, probes: list[Probe], maps: list[Map], regs: int) -> tuple[
 
         # else just ignore
     params_added = params_added + count_params # formulate the layout
-    ptx_lines.insert(param_end_line + 1, ",\n".join(params_added))
-    offset += 1 # in total one line is added 
+    signature = "\n".join(ptx_lines[:entry_last_line + 1])
+    has_params = bool(signature[signature.index("(") + 1:signature.rindex(")")].strip())
+    close = ptx_lines[entry_last_line].index(")")
+    line = ptx_lines[entry_last_line]
+    ptx_lines[entry_last_line] = (line[:close] + (",\n" if has_params else "\n") +
+                                  ",\n".join(params_added) + "\n" + line[close:])
     # Now add the probe with kernel:start -> this shall not dump anything I think
-    ptx_lines.insert(body_start_line + offset + 1, f".reg .u64 %NR<{regs + 1}>;")
+    initializers = []
+    for reg in registers:
+        if (type(reg.get("index")) is not int or not 0 <= reg["index"] <= regs or
+                type(reg.get("init")) is not int or reg.get("dtype") not in ("u32", "u64")):
+            raise ValueError("Invalid probe register initialization")
+        initial = reg["init"] & ((1 << int(reg["dtype"][1:])) - 1)
+        initializers.append(f"mov.u64 %NR{reg['index']}, {initial};")
+    ptx_lines.insert(body_start_line + offset + 1,
+                     f".reg .u64 %NR<{regs + 1}>;\n" + declarations + "\n" + "\n".join(initializers))
     offset += 1
     for probe in kernel_start_probes:
         # NOTE kernel:start probe has no helpers and have no predicate
@@ -544,29 +565,15 @@ def probing(asm: str, probes: list[Probe], maps: list[Map], regs: int) -> tuple[
                     map_ = name_to_map[snippet_line[snippet_line.index("[") + 1: snippet_line.index("]")].strip()]
                     # dtype = snippet_line[snippet_line.find("SAVE") + 5: snippet_line.find("SAVE") + 8]
                     items = snippet_line[snippet_line.index("{") + 1:snippet_line.index("}")].split(",")
-                    assert len(items) == len(map_.regs), f"{map_.name}.save not follow definition"
-                    cvt_lines, u64s, u32s = [], [], []
-                    u32_idx = 1 # NOTE must be 1 due to some syntax issue I think
-                    for item, reg in zip(items, map_.regs):
-                        if reg.dtype == "u64": 
-                            u64s.append(item)
-                        elif reg.dtype == "u32": # apply conversion
-                            cvt_lines.append(f"{pred}cvt.u32.u64 %{map_.name}_u32_{u32_idx}, {item};\n")
-                            u32s.append(f"%{map_.name}_u32_{u32_idx}")
-                            u32_idx += 1
-                        else:
-                            raise NotImplementedError
-                    assert len(u32s) % 2 == 0, "Must save 2n u32 registers for memory alignment, please promote to u64"
-                    save_lines = []
-                    for item_idx in range(len(u64s) // 2):
-                        save_lines.append(f"{pred}st.global.v2.u64 [%map_{map_.name}1],  {{ {u64s[item_idx * 2]}, {u64s[item_idx * 2 + 1]} }};\n{pred}add.s64 %map_{map_.name}1, %map_{map_.name}1, 16;")
-                    if len(u64s) % 2 != 0: # odd number -> one item left!
-                        save_lines.append(f"{pred}st.global.u64 [%map_{map_.name}1], {u64s[-1]};\n{pred}add.s64 %map_{map_.name}1, %map_{map_.name}1, 8;")
-                    for item_idx in range(len(u32s) // 4):
-                        save_lines.append(f"{pred}st.global.v4.u32 [%map_{map_.name}1],  {{ {u32s[item_idx * 4]}, {u32s[item_idx * 4 + 1]}, {u32s[item_idx * 4 + 2]}, {u32s[item_idx * 4 + 3]} }};\n{pred}add.s64 %map_{map_.name}1, %map_{map_.name}1, 16;")
-                    if len(u32s) % 4 != 0: # two items left...
-                        save_lines.append(f"{pred}st.global.v2.u32 [%map_{map_.name}1],  {{ {u32s[-2]}, {u32s[-1]} }};\n{pred}add.s64 %map_{map_.name}1, %map_{map_.name}1, 8;")
-                    snippet_lines[snippet_line_idx] = "\n".join(cvt_lines) + "\n".join(save_lines)
+                    literals = []
+                    for item_index, item in enumerate(items):
+                        if re.fullmatch(r"\s*-?(?:0x[\da-fA-F]+|\d+)\s*", item):
+                            reg = f"%save_literal_{item_index}"
+                            literals.extend((f".reg .u64 {reg};", f"{pred}mov.u64 {reg}, {item.strip()};"))
+                            items[item_index] = reg
+                    save = emit_save(map_, items, pred)
+                    snippet_lines[snippet_line_idx] = ("{\n" + "\n".join(literals) + "\n" + save + "\n}"
+                                                       if literals else save)
                 else:
                     # or just add the pred!
                     # NOTE handling warp that having double buffer
@@ -575,7 +582,12 @@ def probing(asm: str, probes: list[Probe], maps: list[Map], regs: int) -> tuple[
                     else:
                         snippet_lines[snippet_line_idx] = snippet_line
             if probe.level == "warp" and org_pred != "":
-                snippet_lines.insert(0, f"and.pred %tmp, %leader, {org_pred[1:]}; // joint prediction") # ignore the '@' signal at first
+                operand = org_pred.strip()[1:]
+                operation = "and.pred %joint_pred, %leader, "
+                if operand.startswith("!"):
+                    snippet_lines.insert(0, f"not.pred %joint_pred, {operand[1:]};\n" + operation + "%joint_pred;")
+                else:
+                    snippet_lines.insert(0, operation + operand + ";")
             snippet = "\n".join(snippet_lines)
             # finally replace the Ref with snippet to finish the probing!
             ptx_lines[idx] = snippet
@@ -656,6 +668,7 @@ def write_kernel_info(name: str, params: list[KernelParam], map_sizes: list[int]
 if __name__ == "__main__":
     # no argparse as the CLI is straightforward
     workdir = sys.argv[1]     # directory contains original.bin
+    log = open(os.path.join(workdir, "process.log"), 'w')
     kernel_name = sys.argv[2].encode('utf-8', 'ignore').decode('utf-8', 'ignore') # for possible case with multiple entry in one binary
 
     probes: dict

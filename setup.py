@@ -25,6 +25,7 @@ setup(
     py_modules=["neutrino"],
     entry_points={
         'console_scripts': [
+            'neutrino-nvcc = neutrino.nvcc_wrapper:main',
             'neutrino = neutrino.cli:main',  # Links 'myentry' command to `main` function in `myentry.py`
         ],
     },

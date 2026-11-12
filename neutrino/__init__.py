@@ -1,5 +1,9 @@
 from typing import NamedTuple, Union, Literal
 
+# Load the inert engine package before defining the public decorator. Otherwise
+# a later engine import replaces neutrino.probe with the package object.
+from . import probe as _probe_engine
+
 class TraceHeader(NamedTuple):
     gridDimX: int
     gridDimY: int
@@ -15,7 +19,8 @@ class TraceSection(NamedTuple):
     warpDiv: int
     offset:  int
 
-def probe(pos: str, after: bool = False, level: str = "thread", size: int = 0):
+def probe(pos: str, after: bool = False, level: str = "thread", size: int = 0,
+          *, before: bool = False, funcname: str | None = None):
     """Neutrino Probe Entry"""
     from functools import wraps
     # Just preventing the execution as we take it as part of AST only

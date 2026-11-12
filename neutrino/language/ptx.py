@@ -3,10 +3,10 @@
 from neutrino.common import Register, Probe, Map
 
 def filter_keyword(reg: str) -> str:
-    if reg in {"ADDR", "BYTES", "OUT", "IN1", "IN2", "IN3", "IN4"}:
+    if reg in {"ADDR", "BYTES", "OUT", "IN1", "IN2", "IN3", "IN4", "SITE_ID", "EVENT_KIND"}:
         return reg
     elif isinstance(reg, int):
-        return reg
+        return str(reg)
     else:
         return "%" + reg
 

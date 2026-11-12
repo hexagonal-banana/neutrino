@@ -109,7 +109,7 @@ SAVE [ block_sched ] {%PD0, %P1, %P2};"""
 </table>
 
 The interface of `@neutrino.Probe` is inspired by [Triton](https://triton-lang.org/main/index.html) whose contents (left) will be compiled, rather than executed, into platform-specific assemblies (right). 
-Probes of same `level` and `pos` will be merged.
+Probes with the same `level`, `pos`, and optional `funcname` selector are merged.
 
 The formulation (and the name) of `@neutrino.Map` is prompted by [eBPF Map](https://docs.ebpf.io/linux/concepts/maps/). With structured definition, Neutrino can have save (no illegal memory access) and efficient (race-free, no atomics) persistence. 
 
@@ -117,6 +117,65 @@ To simplify the development, Neutrino also provides some helper functions / oper
 * `nl.clock() / nl.time()`: for reading device-side clock and timer.
 * `nl.addr/out/in1/in2/in3`: for reading register values
 * `Map.save()`: for persisting values for posterior analysis.
+
+### CUDA Inline-Function Probes (Experimental)
+
+Use `pos="func"` and a qualified `funcname` to probe an inline function's entry and exit. Function probes share the existing DSL and maps; `before=True` selects entry, and the default selects exit:
+
+```python
+from neutrino import probe, Map
+import neutrino.language as nl
+
+@Map(level="warp", type="array", size=24, cap=64)
+class function_events:
+  timestamp: nl.u64
+  site: nl.u64
+  event: nl.u64
+
+@probe(pos="func", funcname="sample::adjust", level="warp", before=True)
+def enter():
+  function_events.save(nl.time(), nl.site_id, nl.event)
+
+@probe(pos="func", funcname="sample::adjust", level="warp")
+def leave():
+  function_events.save(nl.time(), nl.site_id, nl.event)
+```
+
+`nl.site_id` identifies the invocation site within a build; `nl.event` is 0 for entry and 1 for exit. Function names match exactly, including overloads and template specializations of a qualified base name. `-k` and `--filter` still select launch-kernel names.
+
+Function boundaries require source markers embedded in the cubin. `neutrino-nvcc prepare` creates private marked headers from a versioned, source-hash-checked policy without modifying the originals. It accepts a JSON policy or a Python probe with `SOURCE_HINTS`; see the built-in [DeepEP barrier probe](neutrino/tools/deepep_barrier.py) for an example. Unmarked kernels are not instrumented; there is no CFG fallback.
+
+For DeepEP/DeepJIT, set `CUDA_HOME` to a compatible toolkit and replace `/path/to/include` with the directory containing `deep_ep/comm/barrier.cuh`. Prepare before starting the application:
+
+```bash
+export NEUTRINO_NVCC_CONFIG="$(neutrino-nvcc prepare \
+  --policy deepep_barrier --include-root /path/to/include \
+  --real-nvcc "$CUDA_HOME/bin/nvcc" --artifact-root ./cache)"
+export EP_JIT_NVCC_COMPILER="$(command -v neutrino-nvcc)"
+export EP_JIT_CACHE_DIR="$(python -c 'import json, os; print(json.load(open(os.environ["NEUTRINO_NVCC_CONFIG"]))["jit_cache_dir"])')"
+export EP_JIT_WITH_LINEINFO=1
+neutrino -p deepep_barrier -k deep_ep --buffer-mb 128 --pool-prewarm 16 \
+  --tracedir ./trace python train.py
+python -m neutrino.utils.function_trace ./trace --output ./trace/decoded
+```
+
+Use the prepared JIT cache, not an existing unmarked cache. For other builds, invoke `neutrino-nvcc` with the application's usual flags and the prepared config. Custom probes run with `neutrino -p custom.py <command>`.
+
+Collection uses private device buffers, CUDA completion events, and a separate nonblocking copy stream. Device buffers are reset before reuse; pinned-host buffers return to the pool after background export. Original launch streams and PDL overlap are preserved.
+
+* `--buffer-mb` limits device-plus-pinned-host pool storage per process (default 128 MiB); `--pool-prewarm` sets slots per capacity class (default 8). Size both for the workload.
+* Pool exhaustion skips that launch's trace and runs the original kernel exactly once. No waiting, replay, or pool growth occurs during steady-state acquisition.
+* `neutrinoFunctionFlush()` drains accepted work for the current context; application CUDA synchronization does not flush host exports. `neutrinoFunctionGetStats()` and `result/pool-stats.json` report coverage and pool usage.
+* The decoder writes `summary.json` and Chrome `timeline.json` for the timestamp/site/event schema. Check coverage, pairing, and saturation before using a trace; map capacity must cover all recorded events.
+* Currently supported: CUDA inline functions, lane-0 warp probes, and finite warp array maps. Times include instrumentation and are GPU-local by default. Graph capture, packed `extra` launches, and unsupported boundaries produce coverage gaps; function and opcode probes cannot be mixed. GIN/RDMA and multi-node execution are unverified.
+
+For approximate CPU alignment, the monitor's MoE workload accepts `--clock-align` with `--benchmark-output`: it samples `%globaltimer` against `CLOCK_MONOTONIC` once at startup and saves CPU step spans. Export with the same run's results (omit `--overview` for individual warp tracks):
+
+```bash
+python -m neutrino.utils.function_trace ./trace --training-results ./training-results.json --overview
+```
+
+The tightest sample's midpoint determines the offset; half its round trip is the startup uncertainty, without drift correction. Alignment requires matching rank/process/device/context identities on one host. Overview spans are cross-warp entry/exit envelopes, not kernel durations.
 
 ## Compatibility
 
@@ -171,10 +230,13 @@ neutrino
 ├── probe    # Probe Engine
 │   ├── __init__.py # Common Definition and Utilities
 │   ├── cuda.py     # CUDA PTX Impl
+│   ├── cuda_function.py # CUDA Inline-Function Probes
+│   ├── function_hints.py # Source Marker Encoding and Selection
 │   └── hip.py      # AMD ROCm Impl
 ├── src      # Hook Driver
 │   ├── common.h    # Platform-agnostic Definition (GNU-only)
 │   ├── cuda.c      # CUDA Impl (NVIDIA-related)
+│   ├── cuda_function_probe.h # Pooled Asynchronous Function Traces
 │   ├── hip.c       # ROCm Impl (AMD-related)
 │   ├── preload.c   # Injector via LD_PRELOAD
 │   ├── parse.py    # Generate Unhook API (NVIDIA/AMD)
@@ -183,6 +245,7 @@ neutrino
 ├── build.py    # Builder for driver in src/
 ├── cli.py      # Command Line Interface Entry
 ├── common.py   # Common Internal API not for User import
+├── nvcc_wrapper.py # Immutable Source-Hint Build Wrapper
 └── __init__.py # Common Defn for user import like probe, Map
 ```
 

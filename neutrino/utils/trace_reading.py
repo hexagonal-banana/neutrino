@@ -37,7 +37,7 @@ TRACE_PARSING_PY = """
         f.seek(sections[{INDEX}].offset)
         for i in range(gridSize):
             records["{MAP_NAME}"].append([])
-            for j in range(blockSize // sections[{INDEX}].warpDiv):
+            for j in range((blockSize + sections[{INDEX}].warpDiv - 1) // sections[{INDEX}].warpDiv):
                 records["{MAP_NAME}"][-1].append([])
                 for k in range(sections[{INDEX}].size // {BYTES}):
                     records["{MAP_NAME}"][i][j].append({MAP_NAME}(*struct.unpack("{FORMAT_STRING}", f.read({BYTES}))))
@@ -55,7 +55,7 @@ def gen_reading_code(probe: dict) -> str:
         reading_bytes = 0
         for reg in map.regs:
             content.append(f"    {reg.name}: int")
-            format_string += "q" if reg.dtype == 'u64' else "I"
+            format_string += "Q" if reg.dtype == 'u64' else "I"
             reading_bytes += 8 if reg.dtype == 'u64' else 4
         trace_structs.append(TRACE_STRUCT_CODE_PY.format(
             MAP_NAME=map.name,
